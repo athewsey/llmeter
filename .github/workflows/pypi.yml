@@ -37,7 +37,14 @@ jobs:
         run: poetry config virtualenvs.create false
 
       - name: Configure pyproject version
-        run: if [[ $GITHUB_REF_TYPE == "tag" ]] && [[ $GITHUB_REF == v* ]]; then poetry version $GITHUB_REF; else echo "Invalid tag trigger"; exit 1; fi
+        run: |
+          if [[ $GITHUB_REF_TYPE == "tag" ]] && [[ $GITHUB_REF_NAME == v* ]]
+          then
+            poetry version $GITHUB_REF_NAME
+          else
+            echo "Invalid tag trigger\nGITHUB_REF_TYPE=${GITHUB_REF_TYPE}\nGITHUB_REF_NAME=${GITHUB_REF_NAME}"
+            exit 1
+          fi
 
       # - name: Install dependencies
       #   run: poetry install --sync --no-interaction
