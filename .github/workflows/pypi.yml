@@ -3,7 +3,7 @@ name: Publish to PyPI
 on:
   push:
     tags:
-      - '*.*.*'
+      - 'v0.1.*'
 
 permissions:
   contents: read
@@ -36,11 +36,14 @@ jobs:
       - name: Update Poetry configuration
         run: poetry config virtualenvs.create false
 
-      - name: Install dependencies
-        run: poetry install --sync --no-interaction
+      - name: Configure pyproject version
+        run: if [[ $GITHUB_REF_TYPE == "tag" ]] && [[ $GITHUB_REF == v* ]]; then poetry version $GITHUB_REF; else echo "Invalid tag trigger"; exit 1; fi
+
+      # - name: Install dependencies
+      #   run: poetry install --sync --no-interaction
 
       - name: Package project
         run: poetry build
 
-      - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      # - name: Publish package distributions to PyPI
+      #   uses: pypa/gh-action-pypi-publish@release/v1
