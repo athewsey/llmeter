@@ -40,7 +40,8 @@ jobs:
         run: |
           if [[ $GITHUB_REF_TYPE == "tag" ]] && [[ $GITHUB_REF_NAME == v* ]]
           then
-            poetry version $GITHUB_REF_NAME
+            # Drop leading 'v'
+            poetry version ${GITHUB_REF_NAME:1}
           else
             echo "Invalid tag trigger\nGITHUB_REF_TYPE=${GITHUB_REF_TYPE}\nGITHUB_REF_NAME=${GITHUB_REF_NAME}"
             exit 1
