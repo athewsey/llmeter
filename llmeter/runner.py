@@ -292,7 +292,7 @@ class _Run(_RunConfig):
                 response: InvocationResponse | None = await asyncio.wait_for(
                     self._queue.get(), timeout=self.timeout
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error("Timeout waiting for response")
                 break
             except Exception as e:
@@ -310,17 +310,15 @@ class _Run(_RunConfig):
             if self.callbacks is not None:
                 [await cb.after_invoke(response) for cb in self.callbacks]
 
-            if self.low_memory and self._running_stats is not None:
-                self._running_stats.update(response.to_dict())
-            else:
+            self._running_stats.update(response.to_dict())
+            if not self.low_memory:
                 self._responses.append(response)
-                self._running_stats.update(response.to_dict())
 
             if self._progress_bar is not None and not self._time_bound:
                 self._progress_bar.update(1)
 
             if self._stats_display is not None:
-                raw = self._running_stats.to_stats()
+                raw = self._running_stats.to_stats(end_time=now_utc())
                 if raw:
                     prefix = (
                         f"reqs={self._running_stats._count}" if self._time_bound else ""
@@ -411,7 +409,6 @@ class _Run(_RunConfig):
             p = next(payload_iter)
             try:
                 p = asyncio.run(process_before_invoke_callbacks(self.callbacks, p))
-                self._running_stats.record_send()
                 response = self._endpoint.invoke(p)
             except Exception as e:
                 logger.exception(f"Error with invocation with payload {p}: {e}")
@@ -422,9 +419,7 @@ class _Run(_RunConfig):
             responses.append(response)
             if self._queue:
                 # fix for thread-aware sync, from https://stackoverflow.com/a/57316517/2109965
-                self._queue._loop.call_soon_threadsafe(  # type: ignore
-                    self._queue.put_nowait, response
-                )
+                self._event_loop.call_soon_threadsafe(self._queue.put_nowait, response)
             sent += 1
             if pbar is not None:
                 pbar.update(1)
@@ -482,7 +477,7 @@ class _Run(_RunConfig):
                 coro,
                 timeout=self.timeout * (n or len(payload)),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("client timeout!")
             return []
 
@@ -596,8 +591,10 @@ class _Run(_RunConfig):
 
         # Address default threads limit in asyncio
         # https://stackoverflow.com/questions/75885213/how-to-increase-asyncio-thread-limits-in-an-existing-co-routine)
-        loop = asyncio.get_running_loop()
-        loop.set_default_executor(ThreadPoolExecutor(max_workers=self.clients + 5))
+        self._event_loop = asyncio.get_running_loop()
+        self._event_loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=self.clients + 5)
+        )
         logger.info("Starting test")
         self._queue = asyncio.Queue()
 
@@ -685,13 +682,14 @@ class _Run(_RunConfig):
             if self._time_bound
             else self.n_requests,
             start_time=run_start_time,
+            first_request_time=self._running_stats._first_send_time,
+            last_request_time=self._running_stats._last_send_time,
             end_time=run_end_time,
         )
 
         # Compute stats from the running accumulators
         result._preloaded_stats = self._running_stats.to_stats(
-            total_requests=result.total_requests,
-            total_test_time=total_test_time,
+            end_time=run_end_time,
             result_dict=result.to_dict(),
         )
         result._preloaded_stats["start_time"] = run_start_time
