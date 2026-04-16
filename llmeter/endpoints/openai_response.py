@@ -20,6 +20,7 @@ from openai.types.responses.response_create_params import (
     ResponseCreateParamsStreaming,
 )
 
+from ..utils import now_utc
 from .base import Endpoint, InvocationResponse
 
 logger = logging.getLogger(__name__)
@@ -72,38 +73,23 @@ class OpenAIResponseEndpoint(Endpoint):
         payload = {**kwargs, **payload}  # type: ignore
         payload["model"] = self.model_id
 
+        request_time = now_utc()
         start_t = time.perf_counter()
         try:
             client_response = self._client.responses.create(**payload)
-        except APIConnectionError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
-        except AuthenticationError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
-        except RateLimitError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
-        except BadRequestError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
         except Exception as e:
             logger.exception(e)
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
 
         response = self._parse_response(client_response, start_t)
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
+        response.request_time = request_time
         return response
 
     def _parse_response(
@@ -256,38 +242,23 @@ class OpenAIResponseStreamEndpoint(OpenAIResponseEndpoint):
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
 
+        request_time = now_utc()
         try:
             start_t = time.perf_counter()
             client_response = self._client.responses.create(**payload)
-        except APIConnectionError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
-        except AuthenticationError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
-        except RateLimitError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
-        except BadRequestError as e:
-            logger.exception(e)
-            return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
-            )
         except Exception as e:
             logger.exception(e)
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
 
         response = self._parse_stream_response(client_response, start_t)
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
+        response.request_time = request_time
         return response
 
     def _parse_stream_response(

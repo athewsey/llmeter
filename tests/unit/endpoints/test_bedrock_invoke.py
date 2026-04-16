@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import datetime
 from io import BytesIO
 import json
 import time
@@ -275,6 +276,7 @@ class TestBedrockInvoke:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "test error" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_payload_no_text(self):
         """
@@ -290,6 +292,7 @@ class TestBedrockInvoke:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "failed to extract input text" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_generic_exception(self):
         """
@@ -307,6 +310,7 @@ class TestBedrockInvoke:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "generic error" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_missing_model_id(self):
         """
@@ -320,6 +324,7 @@ class TestBedrockInvoke:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "invalid length for parameter modelid" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_payload_no_llmeter_markers(self):
         """The request body sent to Bedrock InvokeModel must never contain
@@ -558,3 +563,4 @@ class TestBedrockInvokeStream:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "test error" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)

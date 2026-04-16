@@ -12,7 +12,7 @@ Alternatively, see:
 
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import boto3
@@ -27,6 +27,7 @@ from ..prompt_utils import (
     MediaContent,
     VideoContent,
 )
+from ..utils import now_utc
 from .base import Endpoint, InvocationResponse
 
 logger = logging.getLogger(__name__)
@@ -345,6 +346,7 @@ class BedrockConverse(BedrockBase):
         if not isinstance(payload, dict):
             raise TypeError("Payload must be a dictionary")
 
+        request_time = now_utc()  # Initial estimate (in case of early errors)
         try:
             payload = {**kwargs, **payload}
             if payload.get("inferenceConfig") is None:
@@ -352,30 +354,41 @@ class BedrockConverse(BedrockBase):
 
             payload["modelId"] = self.model_id
             try:
+                request_time = now_utc()
                 start_t = time.perf_counter()
                 client_response = self._bedrock_client.converse(**payload)  # type: ignore
                 time_to_last_token = time.perf_counter() - start_t
             except ClientError as e:
                 logger.error(f"Bedrock API error: {e}")
                 return InvocationResponse.error_output(
-                    input_payload=payload, id=uuid4().hex, error=str(e)
+                    input_payload=payload,
+                    id=uuid4().hex,
+                    error=str(e),
+                    request_time=request_time,
                 )
             except Exception as e:
                 logger.error(f"Unexpected error during API call: {e}")
                 return InvocationResponse.error_output(
-                    input_payload=payload, id=uuid4().hex, error=str(e)
+                    input_payload=payload,
+                    id=uuid4().hex,
+                    error=str(e),
+                    request_time=request_time,
                 )
 
-            response = self._parse_converse_response(client_response)  # type: ignore
+            response = self._parse_converse_response(cast(dict, client_response))
             response.input_payload = payload
             response.input_prompt = self._parse_payload(payload)
+            response.request_time = request_time
             response.time_to_last_token = time_to_last_token
             return response
 
         except Exception as e:
             logger.error(f"Error in invoke method: {e}")
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
 
 
@@ -386,15 +399,20 @@ class BedrockConverseStream(BedrockConverse):
             payload["inferenceConfig"] = self._inference_config or {}
 
         payload["modelId"] = self.model_id
+        request_time = now_utc()
         start_t = time.perf_counter()
         try:
             client_response = self._bedrock_client.converse_stream(**payload)  # type: ignore
         except (ClientError, Exception) as e:
             logger.error(e)
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
         response = self._parse_conversation_stream(client_response, start_t)
+        response.request_time = request_time
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
         return response
@@ -407,7 +425,7 @@ class BedrockConverseStream(BedrockConverse):
 
         Args:
             client_response (dict): The raw response from the Bedrock API
-            start_t (float): The timestamp when the request was initiated
+            start_t (float): High-resolution timestamp when the request was initiated
 
         Returns:
             InvocationResponse: Parsed response containing the generated text and metadata

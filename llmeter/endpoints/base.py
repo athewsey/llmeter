@@ -9,6 +9,7 @@ import importlib
 import json
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -35,6 +36,7 @@ class InvocationResponse:
         input_prompt (str): The input prompt used in the invocation.
         time_per_output_token (float): The average time taken to generate each token in the response.
         error (str): Any error that occurred during invocation.
+        request_time (datetime): The time the request was made.
     """
 
     response_text: str | None
@@ -48,6 +50,7 @@ class InvocationResponse:
     time_per_output_token: float | None = None
     error: str | None = None
     retries: int | None = None
+    request_time: datetime | None = None
 
     def to_json(self, default=llmeter_default_serializer, **kwargs) -> str:
         """Serialize this response to a JSON string.
@@ -69,7 +72,10 @@ class InvocationResponse:
 
     @staticmethod
     def error_output(
-        input_payload: dict | None = None, error=None, id: str | None = None
+        input_payload: dict | None = None,
+        error=None,
+        id: str | None = None,
+        request_time: datetime | None = None,
     ) -> "InvocationResponse":
         return InvocationResponse(
             id=id or uuid4().hex,
@@ -77,6 +83,7 @@ class InvocationResponse:
             input_payload=input_payload,
             time_to_last_token=None,
             error="invocation failed" if error is None else str(error),
+            request_time=request_time,
         )
 
     def __repr__(self):

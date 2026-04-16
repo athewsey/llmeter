@@ -1,6 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import datetime, UTC
+
 import pytest
 
 import llmeter
@@ -11,6 +13,7 @@ from llmeter.endpoints.base import Endpoint, InvocationResponse
 
 
 def test_invocation_response_initialization():
+    dt = datetime.now()
     response = InvocationResponse(
         id="test_id",
         response_text="Hello, world!",
@@ -19,6 +22,7 @@ def test_invocation_response_initialization():
         time_to_last_token=0.5,
         num_tokens_input=3,
         num_tokens_output=2,
+        request_time=dt,
         time_per_output_token=0.2,
     )
     assert response.id == "test_id"
@@ -30,36 +34,53 @@ def test_invocation_response_initialization():
     assert response.num_tokens_output == 2
     assert response.time_per_output_token == 0.2
     assert response.error is None
+    assert response.request_time is dt
 
 
 def test_invocation_response_to_json():
     response = InvocationResponse(
-        id="test_id", response_text="Hello, world!", input_prompt="Say hello"
+        id="test_id",
+        response_text="Hello, world!",
+        input_prompt="Say hello",
+        request_time=datetime(
+            year=2026, month=4, day=16, hour=1, minute=2, second=3, tzinfo=UTC
+        ),
     )
     json_str = response.to_json()
     assert "test_id" in json_str
     assert "Hello, world!" in json_str
     assert "Say hello" in json_str
+    assert "2026-04-16T01:02:03Z" in json_str
 
 
 def test_invocation_response_error_output():
+    dt = datetime.now()
     error_response = InvocationResponse.error_output(
-        input_payload={"input": "Test prompt"}, error="Test error"
+        input_payload={"input": "Test prompt"},
+        error="Test error",
+        request_time=dt,
     )
     assert error_response.response_text is None
     assert error_response.input_payload == {"input": "Test prompt"}
     assert error_response.error == "Test error"
     assert error_response.id is not None
+    assert error_response.request_time is dt
 
 
 def test_invocation_response_repr_and_str():
     response = InvocationResponse(
-        id="test_id", response_text="Hello, world!", input_prompt="Say hello"
+        id="test_id",
+        response_text="Hello, world!",
+        input_prompt="Say hello",
+        request_time=datetime(
+            year=2026, month=4, day=16, hour=1, minute=2, second=3, tzinfo=UTC
+        ),
     )
     repr_str = repr(response)
     str_str = str(response)
     assert "test_id" in repr_str
     assert "Hello, world!" in repr_str
+    assert "2026-04-16T01:02:03Z" in repr_str
     assert "Say hello" in str_str
     assert repr_str != str_str  # str should be indented
 
@@ -151,6 +172,7 @@ def test_endpoint_load_from_dict():
 
 
 def test_invocation_response_to_dict():
+    dt = datetime.now()
     response = InvocationResponse(
         id="test_id",
         response_text="Hello, world!",
@@ -159,6 +181,7 @@ def test_invocation_response_to_dict():
         time_to_last_token=0.5,
         num_tokens_input=3,
         num_tokens_output=2,
+        request_time=dt,
         time_per_output_token=0.2,
     )
     response_dict = response.to_dict()
@@ -169,6 +192,7 @@ def test_invocation_response_to_dict():
     assert response_dict["time_to_last_token"] == 0.5
     assert response_dict["num_tokens_input"] == 3
     assert response_dict["num_tokens_output"] == 2
+    assert response_dict["request_time"] == dt
     assert response_dict["time_per_output_token"] == 0.2
 
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from datetime import datetime
 from typing import Dict
 from unittest.mock import patch
 from uuid import UUID
@@ -115,6 +116,7 @@ def test_sagemaker_endpoint_invoke(sagemaker_endpoint: SageMakerEndpoint):
     assert response.num_tokens_output == 10
     assert isinstance(response.id, str)
     assert UUID(response.id, version=4)
+    assert isinstance(response.request_time, datetime)
 
 
 # @patch("boto3.client")
@@ -163,6 +165,7 @@ def test_sagemaker_endpoint_error_handling(sagemaker_endpoint: SageMakerEndpoint
 
         assert isinstance(response, InvocationResponse)
         assert response.error == "Test error"
+        assert isinstance(response.request_time, datetime)
 
 
 def test_sagemaker_stream_endpoint_error_handling(
@@ -178,6 +181,7 @@ def test_sagemaker_stream_endpoint_error_handling(
 
         assert isinstance(response, InvocationResponse)
         assert response.error == "Test error"
+        assert isinstance(response.request_time, datetime)
 
 
 @pytest.fixture

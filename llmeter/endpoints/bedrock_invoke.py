@@ -12,6 +12,7 @@ import jmespath
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from ..utils import now_utc
 from .base import Endpoint, InvocationResponse
 
 logger = logging.getLogger(__name__)
@@ -260,9 +261,11 @@ class BedrockInvoke(Endpoint):
         if not isinstance(payload, dict):
             raise TypeError("Payload must be a dictionary")
 
+        request_time = now_utc()  # Initial estimate (in case of early errors)
         try:
             req_body = json.dumps(payload).encode("utf-8")
             try:
+                request_time = now_utc()
                 start_t = time.perf_counter()
                 client_response = self._bedrock_client.invoke_model(  # type: ignore
                     accept="application/json",
@@ -276,24 +279,34 @@ class BedrockInvoke(Endpoint):
             except ClientError as e:
                 logger.error(f"Bedrock API error: {e}")
                 return InvocationResponse.error_output(
-                    input_payload=payload, id=uuid4().hex, error=str(e)
+                    input_payload=payload,
+                    id=uuid4().hex,
+                    error=str(e),
+                    request_time=request_time,
                 )
             except Exception as e:
                 logger.error(f"Unexpected error during API call: {e}")
                 return InvocationResponse.error_output(
-                    input_payload=payload, id=uuid4().hex, error=str(e)
+                    input_payload=payload,
+                    id=uuid4().hex,
+                    error=str(e),
+                    request_time=request_time,
                 )
 
             response = self._parse_response(client_response)  # type: ignore
             response.input_payload = payload
             response.input_prompt = self._parse_payload(payload)
+            response.request_time = request_time
             response.time_to_last_token = time_to_last_token
             return response
 
         except Exception as e:
             logger.error(f"Error in invoke method: {e}")
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
 
 
@@ -354,6 +367,7 @@ class BedrockInvokeStream(BedrockInvoke):
 
     def invoke(self, payload: dict) -> InvocationResponse:
         req_body = json.dumps(payload).encode("utf-8")
+        request_time = now_utc()
         try:
             start_t = time.perf_counter()
             client_response = self._bedrock_client.invoke_model_with_response_stream(  # type: ignore
@@ -367,11 +381,15 @@ class BedrockInvokeStream(BedrockInvoke):
         except (ClientError, Exception) as e:
             logger.error(e)
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
         response = self._parse_response_stream(client_response, start_t)
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
+        response.request_time = request_time
         return response
 
     def _parse_response_stream(

@@ -21,6 +21,7 @@ from ..prompt_utils import (
     MediaContent,
     VideoContent,
 )
+from ..utils import now_utc
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class SageMakerEndpoint(SageMakerBase):
         json_payload = json.dumps(payload)
         input_prompt = self._parse_input(payload)
 
+        request_time = now_utc()
         start_t = time.perf_counter()
         try:
             client_response = self._sagemaker_runtime.invoke_endpoint(
@@ -237,6 +239,7 @@ class SageMakerEndpoint(SageMakerBase):
                 input_payload=payload,
                 id=uuid4().hex,
                 error=str(e),
+                request_time=request_time,
             )
 
         time_to_last_token = time.perf_counter() - start_t
@@ -252,6 +255,7 @@ class SageMakerEndpoint(SageMakerBase):
             time_to_last_token=time_to_last_token,
             input_prompt=input_prompt,
             num_tokens_output=num_tokens_output if num_tokens_output else None,
+            request_time=request_time,
         )
 
 
@@ -322,6 +326,7 @@ class SageMakerStreamEndpoint(SageMakerBase):
         json_payload = json.dumps(_payload)
         input_prompt = self._parse_input(_payload)
 
+        request_time = now_utc()
         start_t = time.perf_counter()
         try:
             client_response = (
@@ -333,15 +338,24 @@ class SageMakerStreamEndpoint(SageMakerBase):
             )
         except Exception as e:
             logger.error(e)
-            return InvocationResponse.error_output(input_payload=payload, error=str(e))
+            return InvocationResponse.error_output(
+                input_payload=payload,
+                error=str(e),
+                request_time=request_time,
+            )
 
         try:
             response = self._parse_client_response(client_response, start_t)
             response.input_payload = payload
             response.input_prompt = input_prompt
+            response.request_time = request_time
             return response
         except Exception as e:
-            return InvocationResponse.error_output(input_payload=payload, error=str(e))
+            return InvocationResponse.error_output(
+                input_payload=payload,
+                error=str(e),
+                request_time=request_time,
+            )
 
     @staticmethod
     def create_payload(

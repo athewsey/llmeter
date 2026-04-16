@@ -3,6 +3,7 @@
 
 """Unit tests for error handling in OpenAIResponse{Stream}Endpoint classes."""
 
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 from openai import (
@@ -42,6 +43,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_authentication_error(self, mock_openai_class):
@@ -61,6 +63,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_rate_limit_error(self, mock_openai_class):
@@ -80,6 +83,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_bad_request_error(self, mock_openai_class):
@@ -99,6 +103,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_generic_exception(self, mock_openai_class):
@@ -116,6 +121,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
 
 class TestResponseStreamEndpointErrorHandling:
@@ -142,6 +148,7 @@ class TestResponseStreamEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_authentication_error(self, mock_openai_class):
@@ -161,6 +168,7 @@ class TestResponseStreamEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_rate_limit_error(self, mock_openai_class):
@@ -180,6 +188,7 @@ class TestResponseStreamEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_bad_request_error(self, mock_openai_class):
@@ -199,6 +208,7 @@ class TestResponseStreamEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_invoke_generic_exception(self, mock_openai_class):
@@ -216,3 +226,4 @@ class TestResponseStreamEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)

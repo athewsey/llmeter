@@ -159,8 +159,8 @@ async def test_invoke_n_no_wait(run: _Run):
     run.callbacks = None
     # Mock the queue and callbacks to avoid asyncio.run() issues
     run.callbacks = None
-    run._queue = AsyncMock()
-    run._queue._loop.call_soon_threadsafe = MagicMock()
+    run._event_loop = MagicMock()
+    run._event_loop.call_soon_threadsafe = MagicMock()
 
     result = run._invoke_n_no_wait(
         payload=[{"prompt": "test1"}, {"prompt": "test2"}], n=2
@@ -460,9 +460,22 @@ async def test_run_with_sequence_payload(runner: Runner):
 
 
 @pytest.mark.asyncio
-async def test_count_tokens_from_q_timeout(run: _Run):
+async def test_count_tokens_from_q_asyncio_timeout(run: _Run):
     run._queue = AsyncMock()
     run._queue.get.side_effect = asyncio.TimeoutError()
+
+    await run._process_results_from_q()
+
+    run._queue.assert_awaited_once
+    run._queue.task_done = MagicMock()
+
+    # assert len(run._responses) == 0
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_from_q_native_timeout(run: _Run):
+    run._queue = AsyncMock()
+    run._queue.get.side_effect = TimeoutError()
 
     await run._process_results_from_q()
 
@@ -1087,7 +1100,8 @@ def test_invoke_for_duration_respects_deadline(
     )
     run.callbacks = None
     run._queue = MagicMock()
-    run._queue._loop.call_soon_threadsafe = MagicMock()
+    run._event_loop = MagicMock()
+    run._event_loop.call_soon_threadsafe = MagicMock()
 
     # Make invoke take ~100ms so we get a handful of requests
     def slow_invoke(payload):
@@ -1119,7 +1133,8 @@ def test_invoke_for_duration_cycles_payloads(
     )
     run.callbacks = None
     run._queue = MagicMock()
-    run._queue._loop.call_soon_threadsafe = MagicMock()
+    run._event_loop = MagicMock()
+    run._event_loop.call_soon_threadsafe = MagicMock()
 
     payloads_seen = []
 

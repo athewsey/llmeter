@@ -8,6 +8,7 @@ This module tests endpoint initialization, payload creation, response parsing,
 error handling, and timing measurements for the OpenAIResponseEndpoint class.
 """
 
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 from llmeter.endpoints.openai_response import OpenAIResponseEndpoint
@@ -197,6 +198,7 @@ class TestOpenAIResponseEndpointResponseParsing:
         assert response.time_to_last_token is not None
         assert response.time_to_last_token > 0
         assert response.error is None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_parse_response_missing_usage(self, mock_openai_class):
@@ -223,6 +225,7 @@ class TestOpenAIResponseEndpointResponseParsing:
         assert response.num_tokens_output is None
         assert response.time_to_last_token is not None
         assert response.error is None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_parse_response_empty_content(self, mock_openai_class):
@@ -250,6 +253,7 @@ class TestOpenAIResponseEndpointResponseParsing:
         assert response.num_tokens_input == 5
         assert response.num_tokens_output == 0
         assert response.error is None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_extract_response_id(self, mock_openai_class):
@@ -272,6 +276,7 @@ class TestOpenAIResponseEndpointResponseParsing:
 
         # Verify response ID is extracted correctly
         assert response.id == "resp_test_id_12345"
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_extract_token_counts(self, mock_openai_class):
@@ -295,6 +300,7 @@ class TestOpenAIResponseEndpointResponseParsing:
         # Verify token counts are extracted correctly
         assert response.num_tokens_input == 25
         assert response.num_tokens_output == 50
+        assert isinstance(response.request_time, datetime)
 
 
 class TestOpenAIResponseEndpointErrorHandling:
@@ -326,6 +332,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_authentication_error(self, mock_openai_class):
@@ -349,6 +356,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_rate_limit_error(self, mock_openai_class):
@@ -372,6 +380,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_bad_request_error(self, mock_openai_class):
@@ -395,6 +404,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     def test_generic_exception(self, mock_openai_class):
@@ -414,6 +424,7 @@ class TestOpenAIResponseEndpointErrorHandling:
         assert response.response_text is None
         assert response.input_payload is not None
         assert response.id is not None
+        assert isinstance(response.request_time, datetime)
 
 
 class TestOpenAIResponseEndpointTimingMeasurements:
@@ -444,6 +455,7 @@ class TestOpenAIResponseEndpointTimingMeasurements:
         # Verify time_to_last_token is positive
         assert response.time_to_last_token is not None
         assert response.time_to_last_token > 0
+        assert isinstance(response.request_time, datetime)
 
     @patch("llmeter.endpoints.openai_response.OpenAI")
     @patch("time.perf_counter")
@@ -470,3 +482,4 @@ class TestOpenAIResponseEndpointTimingMeasurements:
 
         # Verify timing calculation (1.5 - 1.0 = 0.5)
         assert response.time_to_last_token == 0.5
+        assert isinstance(response.request_time, datetime)

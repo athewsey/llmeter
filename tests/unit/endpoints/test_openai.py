@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import time
+from datetime import datetime
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -221,6 +222,7 @@ class TestOpenAICompletionEndpoint:
             assert response.time_to_last_token > 0
             assert response.error is None
             assert response.input_payload["model"] == "gpt-3.5-turbo"
+            assert isinstance(response.request_time, datetime)
 
     def test_invoke_with_kwargs(self, endpoint, mock_chat_completion):
         """Test invoke with additional kwargs."""
@@ -254,6 +256,7 @@ class TestOpenAICompletionEndpoint:
             assert response.error is not None
             assert response.response_text is None
             assert response.id is not None
+            assert isinstance(response.request_time, datetime)
 
     def test_invoke_generic_exception(self, endpoint):
         """Test invoke with generic exception."""
@@ -267,6 +270,7 @@ class TestOpenAICompletionEndpoint:
             assert isinstance(response, InvocationResponse)
             assert response.error == "Unexpected error"
             assert response.response_text is None
+            assert isinstance(response.request_time, datetime)
 
     def test_parse_converse_response(self, endpoint, mock_chat_completion):
         """Test _parse_converse_response method."""
@@ -319,6 +323,7 @@ class TestOpenAICompletionEndpoint:
             response = endpoint.invoke(payload)
 
             assert response.input_prompt == "Hello\nHow are you?"
+            assert isinstance(response.request_time, datetime)
 
 
 class TestOpenAICompletionStreamEndpoint:
@@ -376,6 +381,7 @@ class TestOpenAICompletionStreamEndpoint:
             assert response.time_to_last_token is not None
             assert response.time_to_first_token < response.time_to_last_token
             assert response.error is None
+            assert isinstance(response.request_time, datetime)
 
     def test_invoke_sets_stream_parameters(self, endpoint, mock_stream_response):
         """Test that invoke sets stream parameters correctly."""
@@ -429,6 +435,7 @@ class TestOpenAICompletionStreamEndpoint:
             assert isinstance(response, InvocationResponse)
             assert response.error is not None
             assert response.response_text is None
+            assert isinstance(response.request_time, datetime)
 
     def test_invoke_generic_exception(self, endpoint):
         """Test invoke with generic exception."""
@@ -442,6 +449,7 @@ class TestOpenAICompletionStreamEndpoint:
             assert isinstance(response, InvocationResponse)
             assert response.error == "Unexpected error"
             assert response.response_text is None
+            assert isinstance(response.request_time, datetime)
 
     def test_parse_converse_stream_response(self, endpoint, mock_stream_response):
         """Test _parse_converse_stream_response method."""
@@ -526,6 +534,7 @@ class TestOpenAICompletionStreamEndpoint:
             response = endpoint.invoke(payload)
 
             assert response.input_prompt == "Hello\nHow are you?"
+            assert isinstance(response.request_time, datetime)
 
 
 class TestOpenAIEndpointIntegration:
@@ -606,6 +615,8 @@ class TestOpenAIEndpointIntegration:
         assert stream_response.error == error_message
         assert completion_response.response_text is None
         assert stream_response.response_text is None
+        assert isinstance(completion_response.request_time, datetime)
+        assert isinstance(stream_response.request_time, datetime)
 
 
 class TestOpenAIEndpointEdgeCases:
@@ -646,6 +657,7 @@ class TestOpenAIEndpointEdgeCases:
 
             assert isinstance(response, InvocationResponse)
             assert response.error is not None
+            assert isinstance(response.request_time, datetime)
 
     def test_stream_endpoint_with_malformed_chunks(self):
         """Test streaming endpoint with malformed response chunks."""
@@ -704,6 +716,7 @@ class TestOpenAIEndpointEdgeCases:
             if response.time_to_last_token is not None:
                 assert response.time_to_last_token >= 0.01
                 assert response.time_to_last_token < 1.0  # Should be less than 1 second
+            assert isinstance(response.request_time, datetime)
 
     def test_stream_response_with_multiple_content_chunks(self):
         """Test streaming response with multiple content chunks including empty ones."""
@@ -744,6 +757,7 @@ class TestOpenAIEndpointEdgeCases:
             assert response.response_text == "Hello world"
             assert response.num_tokens_input == 5
             assert response.num_tokens_output == 3
+            assert isinstance(response.request_time, datetime)
 
     def test_stream_response_usage_none_value(self):
         """Test streaming response when usage attribute exists but is None."""
@@ -772,3 +786,4 @@ class TestOpenAIEndpointEdgeCases:
             assert response.response_text == "Hello world"
             assert response.num_tokens_input is None
             assert response.num_tokens_output is None
+            assert isinstance(response.request_time, datetime)

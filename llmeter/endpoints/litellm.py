@@ -13,6 +13,7 @@ from litellm import CustomStreamWrapper, completion
 from litellm.types.utils import ModelResponse
 from litellm.utils import get_llm_provider  # type: ignore
 
+from ..utils import now_utc
 from . import Endpoint, InvocationResponse
 
 logger = logging.getLogger(__name__)
@@ -77,18 +78,23 @@ class LiteLLMBase(Endpoint):
 
 class LiteLLM(LiteLLMBase):
     def invoke(self, payload, **kwargs):
+        request_time = now_utc()
         try:
             response = completion(model=self.litellm_model, **payload, **kwargs)
             if not isinstance(response, ModelResponse):
                 raise ValueError(f"Expected ModelResponse, got {type(response)}")
             response = self._parse_converse_response(response)
             response.input_prompt = self._parse_payload(payload)
+            response.request_time = request_time
             return response
 
         except Exception as e:
             logger.exception(e)
             response = InvocationResponse.error_output(
-                input_payload=payload, error=str(e), id=uuid4().hex
+                input_payload=payload,
+                error=str(e),
+                id=uuid4().hex,
+                request_time=request_time,
             )
             response.input_prompt = self._parse_payload(payload)
             return response
@@ -135,6 +141,7 @@ class LiteLLMStreaming(LiteLLMBase):
             existing_options = payload_copy.get("stream_options", {})
             payload_copy["stream_options"] = {**existing_options, "include_usage": True}
 
+        request_time = now_utc()
         try:
             start_t = time.perf_counter()
             response = completion(
@@ -143,7 +150,10 @@ class LiteLLMStreaming(LiteLLMBase):
         except Exception as e:
             logger.exception(e)
             response = InvocationResponse.error_output(
-                input_payload=payload, error=str(e), id=uuid4().hex
+                input_payload=payload,
+                error=str(e),
+                id=uuid4().hex,
+                request_time=request_time,
             )
             response.input_prompt = self._parse_payload(payload)
             return response
@@ -152,6 +162,7 @@ class LiteLLMStreaming(LiteLLMBase):
             raise ValueError(f"Expected CustomStreamWrapper, got {type(response)}")
         response = self._parse_stream(response, start_t)
         response.input_prompt = self._parse_payload(payload)
+        response.request_time = request_time
         return response
 
     def _parse_stream(

@@ -25,6 +25,7 @@ from ..prompt_utils import (
     MediaContent,
     VideoContent,
 )
+from ..utils import now_utc
 from .base import Endpoint, InvocationResponse
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,7 @@ class OpenAICompletionEndpoint(OpenAIEndpoint):
         payload = {**kwargs, **payload}
         payload["model"] = self.model_id
 
+        request_time = now_utc()
         start_t = time.perf_counter()
         try:
             client_response: ChatCompletion = self._client.chat.completions.create(
@@ -248,12 +250,16 @@ class OpenAICompletionEndpoint(OpenAIEndpoint):
         except (APIConnectionError, Exception) as e:
             logger.error(e)
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
 
         response = self._parse_converse_response(client_response, start_t)
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
+        response.request_time = request_time
         return response
 
     def _parse_converse_response(self, client_response: ChatCompletion, start_t: float):
@@ -289,17 +295,22 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint):
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
 
+        request_time = now_utc()
         try:
             start_t = time.perf_counter()
             client_response = self._client.chat.completions.create(**payload)
         except (APIConnectionError, Exception) as e:
             logger.error(e)
             return InvocationResponse.error_output(
-                input_payload=payload, id=uuid4().hex, error=str(e)
+                input_payload=payload,
+                id=uuid4().hex,
+                error=str(e),
+                request_time=request_time,
             )
         response = self._parse_converse_stream_response(client_response, start_t)
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
+        response.request_time = request_time
         return response
 
     def _parse_converse_stream_response(

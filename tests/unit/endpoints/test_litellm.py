@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 from llmeter.endpoints.base import InvocationResponse
@@ -163,6 +164,7 @@ class TestLiteLLM:
             assert result.num_tokens_input == 10
             assert result.num_tokens_output == 5
             assert result.input_prompt == '[{"role": "user", "content": "Hello"}]'
+            assert isinstance(result.request_time, datetime)
             mock_completion.assert_called_once_with(model="gpt-3.5-turbo", **payload)
 
     @patch("llmeter.endpoints.litellm.completion")
@@ -188,6 +190,7 @@ class TestLiteLLM:
             assert result.response_text == "Hello there!"
             assert result.num_tokens_input is None
             assert result.num_tokens_output is None
+            assert isinstance(result.request_time, datetime)
 
     @patch("llmeter.endpoints.litellm.completion")
     def test_invoke_with_kwargs(self, mock_completion):
@@ -228,6 +231,7 @@ class TestLiteLLM:
         assert result.error == "API Error"
         assert result.input_prompt == '[{"role": "user", "content": "Hello"}]'
         assert result.id is not None and len(result.id) == 32  # UUID hex length
+        assert isinstance(result.request_time, datetime)
 
     def test_parse_converse_response(self):
         """Test _parse_converse_response method."""
@@ -329,6 +333,7 @@ class TestLiteLLMStreaming:
         assert result.time_to_last_token == 0.2
         # time_per_output_token is computed by the runner, not the endpoint
         assert result.time_per_output_token is None
+        assert isinstance(result.request_time, datetime)
 
         # Check that stream options were set
         mock_completion.assert_called_once()
@@ -388,6 +393,7 @@ class TestLiteLLMStreaming:
         assert isinstance(result, InvocationResponse)
         assert result.error == "Stream error"
         assert result.input_prompt == '[{"role": "user", "content": "Hello"}]'
+        assert isinstance(result.request_time, datetime)
 
     @patch("time.perf_counter")
     def test_parse_stream(self, mock_time):

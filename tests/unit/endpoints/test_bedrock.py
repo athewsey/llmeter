@@ -3,6 +3,7 @@
 
 import time
 import uuid
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 import pytest
@@ -611,6 +612,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "test error" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_client_exception(self):
         """
@@ -629,6 +631,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "Unexpected error" in str(response.error)
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_empty_payload(self):
         """
@@ -641,6 +644,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "expected string for output text" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     # def test_invoke_empty_payload_2(self): #TODO: fix mocking of boto3 client
     #     """
@@ -671,6 +675,7 @@ class TestBedrock:
         assert response.response_text is None
         assert response.time_to_first_token is None
         assert response.time_to_last_token is None
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_error_when_inference_config_is_none(self):
         """
@@ -699,6 +704,7 @@ class TestBedrock:
             "modelId": "test_model",
             "inferenceConfig": {},
         }
+        assert isinstance(result.request_time, datetime)
 
     def test_invoke_generic_exception(self):
         """
@@ -715,6 +721,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "generic error" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_incorrect_payload_format(self):
         """
@@ -728,6 +735,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         # assert "payload" in str(response.error)
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_invalid_model_id(self):
         """
@@ -747,6 +755,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "Model not found" in str(response.error)
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_invalid_payload_format(self):
         """
@@ -758,6 +767,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "unknown parameter" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_missing_model_id(self):
         """
@@ -771,6 +781,7 @@ class TestBedrock:
         assert isinstance(response, InvocationResponse)
         assert response.error is not None
         assert "invalid length for parameter modelid" in str(response.error).lower()
+        assert isinstance(response.request_time, datetime)
 
     def test_invoke_when_inference_config_is_none_and_client_error_occurs(self):
         """
@@ -807,6 +818,7 @@ class TestBedrock:
             "inferenceConfig": {},
             "modelId": "test_model",
         }
+        assert isinstance(response.request_time, datetime)
 
         # Verify that the Bedrock client's converse_stream method was called with the correct payload
         mock_bedrock_client.converse_stream.assert_called_once_with(
