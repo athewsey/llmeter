@@ -677,8 +677,9 @@ class TestOpenAIEndpointEdgeCases:
             payload = {"messages": [{"role": "user", "content": "Hello"}]}
 
             # This should raise AttributeError when trying to access choices
-            with pytest.raises(AttributeError):
-                endpoint.invoke(payload)
+            response = endpoint.invoke(payload)
+            assert response.error
+            assert "choices" in response.error
 
     def test_response_timing_accuracy(self):
         """Test that response timing measurements are accurate."""

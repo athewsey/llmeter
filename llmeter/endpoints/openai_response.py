@@ -246,6 +246,7 @@ class OpenAIResponseStreamEndpoint(OpenAIResponseEndpoint):
         try:
             start_t = time.perf_counter()
             client_response = self._client.responses.create(**payload)
+            response = self._parse_stream_response(client_response, start_t)
         except Exception as e:
             logger.exception(e)
             return InvocationResponse.error_output(
@@ -255,7 +256,6 @@ class OpenAIResponseStreamEndpoint(OpenAIResponseEndpoint):
                 request_time=request_time,
             )
 
-        response = self._parse_stream_response(client_response, start_t)
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
         response.request_time = request_time

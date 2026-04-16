@@ -299,6 +299,7 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint):
         try:
             start_t = time.perf_counter()
             client_response = self._client.chat.completions.create(**payload)
+            response = self._parse_converse_stream_response(client_response, start_t)
         except (APIConnectionError, Exception) as e:
             logger.error(e)
             return InvocationResponse.error_output(
@@ -307,7 +308,7 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint):
                 error=str(e),
                 request_time=request_time,
             )
-        response = self._parse_converse_stream_response(client_response, start_t)
+
         response.input_payload = payload
         response.input_prompt = self._parse_payload(payload)
         response.request_time = request_time

@@ -147,6 +147,9 @@ class LiteLLMStreaming(LiteLLMBase):
             response = completion(
                 model=self.litellm_model, **payload_copy, **clean_kwargs
             )
+            if not isinstance(response, CustomStreamWrapper):
+                raise ValueError(f"Expected CustomStreamWrapper, got {type(response)}")
+            response = self._parse_stream(response, start_t)
         except Exception as e:
             logger.exception(e)
             response = InvocationResponse.error_output(
@@ -158,9 +161,6 @@ class LiteLLMStreaming(LiteLLMBase):
             response.input_prompt = self._parse_payload(payload)
             return response
 
-        if not isinstance(response, CustomStreamWrapper):
-            raise ValueError(f"Expected CustomStreamWrapper, got {type(response)}")
-        response = self._parse_stream(response, start_t)
         response.input_prompt = self._parse_payload(payload)
         response.request_time = request_time
         return response
