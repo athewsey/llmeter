@@ -34,19 +34,21 @@ LLMeter also offers extra features that require additional dependencies. Current
 
 - **plotting**: Add methods to generate charts to summarize the results
 - **openai**: Enable testing endpoints offered by OpenAI
+- **anthropic**: Enable testing Anthropic's Claude models
+- **gemini**: Enable testing Google's Gemini models
 - **litellm**: Enable testing a range of different models through [LiteLLM](https://github.com/BerriAI/litellm)
 - **mlflow**: Enable logging LLMeter experiments to [MLFlow](https://mlflow.org/)
 
 You can install one or more of these extra options using pip:
 
 ```terminal
-pip install 'llmeter[plotting,openai,litellm,mlflow]'
+pip install 'llmeter[plotting,openai,anthropic,gemini,litellm,mlflow]'
 ```
 
 Or with uv:
 
 ```terminal
-uv pip install 'llmeter[plotting,openai,litellm,mlflow]'
+uv pip install 'llmeter[plotting,openai,anthropic,gemini,litellm,mlflow]'
 ```
 
 ## 🚀 Quick-start
@@ -61,6 +63,10 @@ endpoint = BedrockConverse(model_id="...")
 # ...or OpenAI...
 from llmeter.endpoints import OpenAIEndpoint
 endpoint = OpenAIEndpoint(model_id="...", api_key="...")
+
+# ...or Gemini...
+from llmeter.endpoints import GeminiEndpoint
+endpoint = GeminiEndpoint(model_id="gemini-2.0-flash-exp", api_key="...")
 
 # ...or via LiteLLM...
 from llmeter.endpoints import LiteLLM
