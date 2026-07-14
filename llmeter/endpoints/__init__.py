@@ -31,3 +31,7 @@ if spec:
 spec = importlib.util.find_spec("litellm")
 if spec:
     from .litellm import LiteLLM, LiteLLMStreaming  # noqa: F401
+
+spec = importlib.util.find_spec("google.generativeai")
+if spec:
+    from .gemini import GeminiEndpoint, GeminiStreamEndpoint  # noqa: F401

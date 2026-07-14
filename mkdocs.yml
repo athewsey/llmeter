@@ -63,6 +63,7 @@ nav:
       - base: reference/endpoints/base.md
       - bedrock: reference/endpoints/bedrock.md
       - bedrock_invoke: reference/endpoints/bedrock_invoke.md
+      - gemini: reference/endpoints/gemini.md
       - litellm: reference/endpoints/litellm.md
       - openai: reference/endpoints/openai.md
       - openai_response: reference/endpoints/openai_response.md

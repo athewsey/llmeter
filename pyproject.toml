@@ -21,12 +21,13 @@ dependencies = [
 anthropic = ["anthropic>=0.91.0"]
 openai = ["openai>=1.35.1"]
 litellm = ["litellm>=1.47.1"]
+gemini = ["google-generativeai>=0.8.0"]
 plotting = ["plotly>=5.24.1", "kaleido<=0.2.1", "pandas>=2.2.0"]
 mlflow = ["mlflow-skinny>=3.10.0"]
 multimodal = ["puremagic>=1.28"]
 tokenizers = ["transformers>=4.40.2", "tiktoken>=0.7.0"]
 all = [
-    "llmeter[anthropic,openai,litellm,plotting,mlflow,multimodal,tokenizers]",
+    "llmeter[anthropic,openai,litellm,gemini,plotting,mlflow,multimodal,tokenizers]",
 ]
 
 [project.urls]
