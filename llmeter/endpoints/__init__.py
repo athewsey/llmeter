@@ -7,6 +7,7 @@ import importlib.util
 from .base import Endpoint, InvocationResponse  # noqa: F401
 from .bedrock import BedrockConverse, BedrockConverseStream  # noqa: F401
 from .bedrock_invoke import BedrockInvoke, BedrockInvokeStream  # noqa: F401
+from .dummy import DummyEndpoint  # noqa: F401
 from .sagemaker import SageMakerEndpoint, SageMakerStreamEndpoint  # noqa: F401
 
 spec = importlib.util.find_spec("openai")
