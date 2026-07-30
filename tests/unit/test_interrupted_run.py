@@ -29,9 +29,7 @@ def sample_responses():
             time_to_last_token=0.3 * (i + 1),
             num_tokens_input=10 * (i + 1),
             num_tokens_output=20 * (i + 1),
-            request_time=datetime(
-                2025, 6, 1, 10, 0, i * 2, tzinfo=timezone.utc
-            ),
+            request_time=datetime(2025, 6, 1, 10, 0, i * 2, tzinfo=timezone.utc),
         )
         for i in range(5)
     ]
@@ -44,7 +42,7 @@ def interrupted_run_dir(tmp_path, sample_responses):
     Contains only responses.jsonl and run_config.json, as would be left behind
     when a run is interrupted before Result.save() completes.
     """
-    from llmeter.json_utils import llmeter_default_serializer
+    from llmeter.serialization import json_default
 
     run_dir = UPath(tmp_path / "interrupted_run")
     run_dir.mkdir(parents=True)
@@ -78,7 +76,7 @@ def interrupted_run_dir(tmp_path, sample_responses):
     }
     config_path = run_dir / "run_config.json"
     with config_path.open("w") as f:
-        json.dump(config, f, default=llmeter_default_serializer)
+        json.dump(config, f, default=json_default)
 
     return run_dir
 
@@ -123,9 +121,7 @@ class TestLoadWithoutSummary:
         assert result.last_request_time == datetime(
             2025, 6, 1, 10, 0, 8, tzinfo=timezone.utc
         )
-        assert result.end_time == datetime(
-            2025, 6, 1, 10, 0, 8, tzinfo=timezone.utc
-        )
+        assert result.end_time == datetime(2025, 6, 1, 10, 0, 8, tzinfo=timezone.utc)
 
     def test_load_sets_total_requests_from_responses(self, interrupted_run_dir):
         """total_requests should be set to the number of recovered responses."""
@@ -214,7 +210,7 @@ class TestLoadWithoutSummary:
     def test_load_recovers_interrupted_run_with_stats(self, tmp_path, sample_responses):
         """Simulates the case where both stats.json and responses.jsonl exist
         (e.g. the interrupt handler managed to write stats before exiting)."""
-        from llmeter.json_utils import llmeter_default_serializer
+        from llmeter.serialization import json_default
 
         run_dir = UPath(tmp_path / "partial_with_stats")
         run_dir.mkdir(parents=True)
@@ -232,7 +228,7 @@ class TestLoadWithoutSummary:
         }
         stats_path = run_dir / "stats.json"
         with stats_path.open("w") as f:
-            json.dump(stats, f, default=llmeter_default_serializer)
+            json.dump(stats, f, default=json_default)
 
         result = Result.load(run_dir)
 
@@ -686,9 +682,7 @@ class TestRunnerInterruptFlow:
             import time
 
             time.sleep(0.05)
-            return InvocationResponse(
-                id="x", input_prompt="test", response_text="resp"
-            )
+            return InvocationResponse(id="x", input_prompt="test", response_text="resp")
 
         mock_endpoint.invoke = slow_invoke
 

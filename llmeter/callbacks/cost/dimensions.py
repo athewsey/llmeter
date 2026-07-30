@@ -15,57 +15,58 @@ use to bring customized cost dimensions for your own cost models.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import ceil
-from typing import Optional
+from typing import Protocol
 
 # Local Dependencies:
 from ...endpoints.base import InvocationResponse
 from ...results import Result
 from ...runner import _RunConfig
-from .serde import ISerializable, JSONableBase
+from ...serialization import Serializable
 
 
-class IRequestCostDimension(ISerializable):
+class IRequestCostDimension(Protocol):
     """Interface for one dimension of a per-request cost model
 
     Per-request cost components are calculated independently for each invocation in a test run, and
     can be used to model factors like cost-per-request, cost-per-input-tokens,
     cost-per-request-duration, etc. They're typically most relevant for serverless deployments like
     Amazon Bedrock, or estimating duration-based execution costs for AWS Lambda functions.
+
+    !!! warning
+        This interface describes only the *calculation* behavior. It intentionally says nothing
+        about serialization: a dimension used purely in-memory need not be serializable. However,
+        to be usable inside a [`CostModel`][llmeter.callbacks.cost.model.CostModel] that gets
+        **saved** (e.g. as a run callback, or via ``save_to_file``), a dimension must
+        **additionally** be LLMeter-serializable. The supported way to get that is to subclass
+        [`RequestCostDimensionBase`][llmeter.callbacks.cost.dimensions.RequestCostDimensionBase]
+        (which mixes in [`Serializable`][llmeter.serialization.Serializable]; implementing this
+        Protocol alone is not sufficient for persistence.
     """
 
-    async def calculate(self, response: InvocationResponse) -> Optional[float]:
+    async def calculate(self, response: InvocationResponse) -> float | None:
         """Calculate (this component of) the cost for an individual request/response"""
         ...
 
 
-class RequestCostDimensionBase(ABC, JSONableBase):
-    """Base class for implementing per-request cost model dimensions
-
-    This class provides a default implementation of `ISerializable` and sets up an abstract method
-    for `calculate()`. It's fine if you don't want to derive from it directly - just be sure to
-    fully implement `IRequestCostDimension`!
-    """
-
-    @abstractmethod
-    async def calculate(self, response: InvocationResponse) -> Optional[float]:
-        """Calculate (this component of) the cost for an individual request/response"""
-        raise NotImplementedError(
-            "Children of RequestCostDimensionBase must implement `calculate()`! At: %s"
-            % (self.__class__,)
-        )
-
-
-class IRunCostDimension(ISerializable):
+class IRunCostDimension(Protocol):
     """Interface for one dimension of a per-Run cost model
 
     Per-run cost components are notified before the start of a test run via `before_run_start()`,
     and then requested to `calculate()` at the end of the run. They're most relevant for
     provisioned-infrastructure based deployments like Amazon SageMaker, where factors like a
     (request-independent) cost-per-hour are important.
+
+    !!! warning
+        As with `IRequestCostDimension`, this interface covers only calculation behavior and not
+        serialization. To be usable inside a
+        [`CostModel`][llmeter.callbacks.cost.model.CostModel] that gets saved, subclass
+        [`RunCostDimensionBase`][llmeter.callbacks.cost.dimensions.RunCostDimensionBase] (which
+        mixes in [`Serializable`][llmeter.serialization.Serializable]) rather than implementing
+        this Protocol alone.
     """
 
     async def before_run_start(self, run_config: _RunConfig) -> None:
-        """Function called to notify the cost component that a test run is about to start
+        """Notify the cost component that a test run is about to start
 
         This method is called before the test run starts, and can be used to perform any
         initialization or setup required for the cost component. In general, we assume a dimension
@@ -75,7 +76,7 @@ class IRunCostDimension(ISerializable):
         """
         ...
 
-    async def calculate(self, result: Result) -> Optional[float]:
+    async def calculate(self, result: Result) -> float | None:
         """Calculate (this component of) the cost for a completed test run
 
         Dimensions that depend on `before_run_start` being called to return an accurate result
@@ -85,20 +86,34 @@ class IRunCostDimension(ISerializable):
         ...
 
 
-class RunCostDimensionBase(ABC, JSONableBase):
+class RequestCostDimensionBase(Serializable, ABC):
+    """Base class for implementing per-request cost model dimensions
+
+    This class provides a default implementation of serialization (via
+    [`Serializable`][llmeter.serialization.Serializable]) and sets up an abstract method for
+    `calculate()`.
+    """
+
+    @abstractmethod
+    async def calculate(self, response: InvocationResponse) -> float | None:
+        """Calculate (this component of) the cost for an individual request/response"""
+        raise NotImplementedError
+
+
+class RunCostDimensionBase(Serializable, ABC):
     """Base class for implementing per-run cost model dimensions
 
-    This class provides a default implementation of `ISerializable`, a default empty
-    `before_run_start` implementation, and abstract methods for the other requirements of the
-    `IRunCostDimension` protocol. It's fine if you don't want to derive from it directly - just
-    make sure you fully implement `IRunCostDimension`!
+    This class provides a default implementation of serialization (via
+    [`Serializable`][llmeter.serialization.Serializable]), a default empty `before_run_start`
+    implementation, and abstract methods for the other requirements of the `IRunCostDimension`
+    protocol.
     """
 
     async def before_run_start(self, run_config: _RunConfig) -> None:
-        """Function called to notify the cost component that a test run is about to start
+        """Notify the cost component that a test run is about to start
 
         This method is called before the test run starts, and can be used to perform any
-        initialization or setup required for the cost component.  In general, we assume a dimension
+        initialization or setup required for the cost component. In general, we assume a dimension
         instance may be re-used for multiple test runs, but only one run at a time: Meaning
         `before_run_start()` should not be called again before `calculate()` is called for the
         previous run.
@@ -108,17 +123,19 @@ class RunCostDimensionBase(ABC, JSONableBase):
         pass
 
     @abstractmethod
-    async def calculate(self, result: Result) -> Optional[float]:
+    async def calculate(self, result: Result) -> float | None:
         """Calculate (this component of) the cost for a completed test run
 
         Dimensions that depend on `before_run_start` being called to return an accurate result
         should throw an error if this was not done. Dimensions that only need `calculate()` should
         silently ignore if `before_run_start` was not called.
         """
-        raise NotImplementedError(
-            "Children of RunCostDimensionBase must implement `calculate()`! At: %s"
-            % (self.__class__,)
-        )
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Concrete dimension implementations
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -133,13 +150,11 @@ class InputTokens(RequestCostDimensionBase):
     price_per_million: float
     granularity: int = 1
 
-    async def calculate(self, req: InvocationResponse) -> Optional[float]:
+    async def calculate(self, req: InvocationResponse) -> float | None:
         if req.num_tokens_input is None:
             return None
-        billable_tokens = (
-            ceil(req.num_tokens_input / self.granularity) * self.granularity
-        )
-        return billable_tokens * self.price_per_million / 1000000
+        billable = ceil(req.num_tokens_input / self.granularity) * self.granularity
+        return billable * self.price_per_million / 1_000_000
 
 
 @dataclass
@@ -154,13 +169,11 @@ class OutputTokens(RequestCostDimensionBase):
     price_per_million: float
     granularity: int = 1
 
-    async def calculate(self, req: InvocationResponse) -> Optional[float]:
+    async def calculate(self, req: InvocationResponse) -> float | None:
         if req.num_tokens_output is None:
             return None
-        billable_tokens = (
-            ceil(req.num_tokens_output / self.granularity) * self.granularity
-        )
-        return billable_tokens * self.price_per_million / 1000000
+        billable = ceil(req.num_tokens_output / self.granularity) * self.granularity
+        return billable * self.price_per_million / 1_000_000
 
 
 @dataclass
@@ -175,10 +188,10 @@ class EndpointTime(RunCostDimensionBase):
     price_per_hour: float
     granularity_secs: float = 1
 
-    async def calculate(self, result: Result) -> Optional[float]:
+    async def calculate(self, result: Result) -> float | None:
         if result.total_test_time is None:
             return None
-        billable_secs = (
+        billable = (
             ceil(result.total_test_time / self.granularity_secs) * self.granularity_secs
         )
-        return billable_secs * self.price_per_hour / 3600
+        return billable * self.price_per_hour / 3600

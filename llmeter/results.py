@@ -3,30 +3,20 @@
 
 import json
 import logging
-import types as _types
-from dataclasses import asdict, dataclass, fields
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from numbers import Number
-from typing import Any, Sequence
+from typing import Any
 
 import jmespath
 from upath.types import ReadablePathLike, WritablePathLike
 
 from .endpoints import InvocationResponse
-from .json_utils import llmeter_default_serializer
+from .serialization import json_default, restore_dataclass_types
 from .utils import ensure_path, summary_stats_from_list
 
 logger = logging.getLogger(__name__)
-
-
-def _get_type_args(tp) -> tuple:
-    """Return the members of a union type (e.g. ``datetime | None`` -> (datetime, NoneType))."""
-    if isinstance(tp, _types.UnionType):
-        return tp.__args__
-    origin = getattr(tp, "__origin__", None)
-    if origin is _types.UnionType:
-        return tp.__args__
-    return (tp,) if isinstance(tp, type) else ()
 
 
 @dataclass
@@ -50,31 +40,13 @@ class Result:
     end_time: datetime | None = None
 
     def __str__(self):
-        return json.dumps(self.stats, indent=4, default=llmeter_default_serializer)
+        return json.dumps(self.stats, indent=4, default=json_default)
 
     def __post_init__(self):
         """Initialize the Result instance."""
         self._contributed_stats = {}
         if not hasattr(self, "_preloaded_stats"):
             self._preloaded_stats = None
-
-    @classmethod
-    def _parse_datetime_fields(cls, d: dict) -> None:
-        """Convert any datetime fields on cls present in d from ISO-8601 strings to datetimes
-
-        Introspects this (data)class to find all `datetime`-typed fields, and converts any matching
-        entries in `d` with ISO-8601 string values to datetimes instead. This is used for loading
-        JSON data (in which dates are stringified) into the Result class or stats.
-        """
-        for f in fields(cls):
-            if datetime not in _get_type_args(f.type):
-                continue
-            val = d.get(f.name)
-            if val and isinstance(val, str):
-                try:
-                    d[f.name] = datetime.fromisoformat(val.replace("Z", "+00:00"))
-                except ValueError:
-                    pass
 
     def _update_contributed_stats(self, stats: dict[str, Number]):
         """
@@ -127,28 +99,35 @@ class Result:
 
         summary_path = output_path / "summary.json"
         stats_path = output_path / "stats.json"
-        with summary_path.open("w") as f, stats_path.open("w") as s:
-            f.write(self.to_json(indent=4))
-            s.write(
-                json.dumps(self.stats, indent=4, default=llmeter_default_serializer)
+        with summary_path.open("w") as f:
+            json.dump(
+                {
+                    k: o
+                    for k, o in asdict(self).items()
+                    if k not in ["responses", "stats"]
+                },
+                f,
+                default=json_default,
+                indent=4,
             )
+        with stats_path.open("w") as f:
+            json.dump(self.stats, f, default=json_default, indent=4)
 
         responses_path = output_path / "responses.jsonl"
         if not responses_path.exists():
             with responses_path.open("w") as f:
                 for response in self.responses:
-                    f.write(
-                        json.dumps(asdict(response), default=llmeter_default_serializer)
-                        + "\n"
-                    )
+                    f.write(json.dumps(asdict(response), default=json_default) + "\n")
 
-    def to_json(self, default=llmeter_default_serializer, **kwargs) -> str:
+    def to_json(
+        self, default: Callable[[Any], Any] | None = json_default, **kwargs: Any
+    ) -> str:
         """Return the results as a JSON string.
 
         Args:
             default: Fallback serializer. Defaults to
-                :func:`~llmeter.json_utils.llmeter_default_serializer`.
-            **kwargs: Extra keyword arguments passed to :func:`json.dumps`.
+                [`json_default`][llmeter.serialization.json_default].
+            **kwargs: Extra keyword arguments passed to `json.dumps`.
         """
         summary = {
             k: o for k, o in asdict(self).items() if k not in ["responses", "stats"]
@@ -158,20 +137,18 @@ class Result:
     def to_dict(self, include_responses: bool = False) -> dict:
         """Return a dictionary representation of this result.
 
-        Returns a plain ``dict`` produced by :func:`dataclasses.asdict`,
-        preserving native Python types (``datetime``, ``UPath``, etc.).
-        This is suitable for programmatic access and internal data
+        Returns a plain `dict` produced by `dataclasses.asdict`, preserving native Python types
+        (`datetime`, `UPath`, etc.). This is suitable for programmatic access and internal data
         processing.
 
-        For JSON output, use :meth:`to_json` which delegates to
-        :func:`~llmeter.json_utils.llmeter_default_serializer` for
-        non-serializable types, or pass the dict through
-        ``json.dumps(result.to_dict(), default=llmeter_default_serializer)``.
+        For JSON output, use `to_json` which delegates to
+        [`json_default`][llmeter.serialization.json_default] for non-serializable types, or pass
+        the dict through `json.dumps(result.to_dict(), default=json_default)`.
 
         Args:
-            include_responses: If ``True``, include the full list of
-                :class:`~llmeter.endpoints.base.InvocationResponse` dicts
-                and the ``stats`` key.  Defaults to ``False``.
+            include_responses: Set `True` to include the full list of
+                [`InvocationResponse`][llmeter.endpoints.base.InvocationResponse] dicts and the
+                `stats` key.
 
         Returns:
             dict: A dictionary of result fields with native Python types.
@@ -269,7 +246,7 @@ class Result:
         with summary_path.open("r") as f:
             summary = json.load(f)
 
-        cls._parse_datetime_fields(summary)
+        restore_dataclass_types(cls, summary)
 
         if "output_path" not in summary or summary["output_path"] is None:
             summary["output_path"] = str(result_path)
@@ -316,9 +293,20 @@ class Result:
                         metadata[passthru_field] = config[passthru_field]
                 endpoint = config.get("endpoint", {})
                 if isinstance(endpoint, dict):
-                    metadata["model_id"] = endpoint.get("model_id")
-                    metadata["endpoint_name"] = endpoint.get("endpoint_name")
-                    metadata["provider"] = endpoint.get("provider")
+                    # Modern format nests endpoint fields under `__llmeter_state__`; legacy
+                    # format keeps them at the top level.
+                    if "__llmeter_class__" in endpoint:
+                        endpoint_fields = endpoint.get("__llmeter_state__", {})
+                    else:
+                        logger.warning(
+                            "Recovering endpoint metadata from a legacy data format. Support for "
+                            "this will be removed in a future major version. Consider re-saving "
+                            "the file to update."
+                        )
+                        endpoint_fields = endpoint
+                    metadata["model_id"] = endpoint_fields.get("model_id")
+                    metadata["endpoint_name"] = endpoint_fields.get("endpoint_name")
+                    metadata["provider"] = endpoint_fields.get("provider")
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"Could not parse run_config.json: {e}")
 
@@ -395,7 +383,7 @@ class Result:
             try:
                 with stats_path.open("r") as s:
                     saved_stats = json.loads(s.read())
-                cls._parse_datetime_fields(saved_stats)
+                restore_dataclass_types(cls, saved_stats)
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning(f"Could not load stats.json: {e}")
                 saved_stats = None

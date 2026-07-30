@@ -5,16 +5,14 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import final
-
-from upath.types import ReadablePathLike, WritablePathLike
 
 from ..endpoints.base import InvocationResponse
 from ..results import Result
 from ..runner import _RunConfig
+from ..serialization import Serializable
 
 
-class Callback(ABC):
+class Callback(Serializable, ABC):
     """Base class for a callback in LLMeter
 
     Callbacks support extending LLMeter functionality by running additional code at defined points
@@ -22,8 +20,11 @@ class Callback(ABC):
     associated with test runs or individual model invocations.
 
     A Callback object may implement multiple of the defined lifecycle hooks (such as
-    `before_invoke`, `after_run`, etc). Callbacks must support serializing their configuration to
-    a file (by implementing `save_to_file`), and loading back (via `load_from_file`).
+    `before_invoke`, `after_run`, etc) - which have no-op implementations by default. Serialization
+    to/from file is inherited from `llmeter.serialization.Serializable`, and is necessary so your
+    callback(s) can be saved to file (and restored) as part of a Run configuration. Any custom
+    callback class that is *not* LLMeter-serializable will raise a `TypeError` when the run config
+    it belongs to is saved.
     """
 
     async def before_invoke(self, payload: dict) -> None:
@@ -44,7 +45,8 @@ class Callback(ABC):
                 timing and token counts)
         Returns:
             None: If you'd like to add information to the `response` logged in the Run, modify it
-                in-place.
+                in-place. To attach **extra custom fields** that you want preserved when responses
+                are saved to file, store them in the `response.annotations` map.
         """
         pass
 
@@ -70,47 +72,3 @@ class Callback(ABC):
             None: If you'd like to modify the run `result`, edit the argument in-place.
         """
         pass
-
-    def save_to_file(self, path: WritablePathLike) -> None:
-        """Save this Callback to file
-
-        Individual Callbacks implement this method to save their configuration to a file that will
-        be re-loadable with the equivalent `_load_from_file()` method.
-
-        Args:
-            path: (Local or Cloud) path where the callback is saved
-        """
-        raise NotImplementedError("TODO: Callback.save_to_file is not yet implemented!")
-
-    @staticmethod
-    @final
-    def load_from_file(path: ReadablePathLike) -> Callback:
-        """Load (any type of) Callback from file
-
-        `Callback.load_from_file()` attempts to detect the type of Callback saved in a given file,
-        and use the relevant implementation's `_load_from_file` method to load it.
-
-        Args:
-            path: (Local or Cloud) path where the callback is saved
-        Returns:
-            callback: A loaded Callback - for example an `MlflowCallback`.
-        """
-        raise NotImplementedError(
-            "TODO: Callback.load_from_file is not yet implemented!"
-        )
-
-    @classmethod
-    def _load_from_file(cls, path: ReadablePathLike) -> Callback:
-        """Load this Callback from file
-
-        Individual Callbacks implement this method to define how they can be loaded from files
-        created by the equivalent `save_to_file()` method.
-
-        Args:
-            path: (Local or Cloud) path where the callback is saved
-        Returns:
-            callback: The loaded Callback object
-        """
-        raise NotImplementedError(
-            "TODO: Callback._load_from_file is not yet implemented!"
-        )

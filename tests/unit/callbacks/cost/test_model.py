@@ -1,45 +1,111 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+import json
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock, NonCallableMock
 
 import pytest
 
+from llmeter.serialization import dump_object, load_object
 from llmeter.callbacks.cost.model import CostModel
 from llmeter.callbacks.cost.results import CalculatedCostWithDimensions
+from llmeter.endpoints.base import InvocationResponse
 
 
 def test_cost_model_serialization():
-    """Cost models can be serialized & de-serialized"""
-    spec = {
-        "_type": "CostModel",
-        "request_dims": {
-            "TokensIn": {"_type": "InputTokens", "price_per_million": 30},
+    """Cost models can be serialized & de-serialized via dump_object/load_object"""
+    from llmeter.callbacks.cost.dimensions import EndpointTime, InputTokens
+
+    model = CostModel(
+        request_dims={"TokensIn": InputTokens(price_per_million=30)},
+        run_dims={"ComputeSeconds": EndpointTime(price_per_hour=50)},
+    )
+
+    # Round-trip via dump_object / load_object
+    data = dump_object(model)
+    restored = load_object(data)
+
+    assert restored.request_dims["TokensIn"].price_per_million == 30
+    assert restored.run_dims["ComputeSeconds"].price_per_hour == 50
+
+    # get state produces a plain dict representation
+    d = model._get_llmeter_state()
+    assert "request_dims" in d
+    assert "run_dims" in d
+
+
+def test_cost_model_save_load_file_roundtrip(tmp_path):
+    """A CostModel can be saved to and loaded from a file, re-initialising its dimensions
+
+    Exercises the inherited Serializable.save_to_file / load_from_file API (file I/O plus
+    json_default), which the in-memory dump_object/load_object test does not cover.
+    """
+    from llmeter.callbacks.cost.dimensions import (
+        EndpointTime,
+        InputTokens,
+        OutputTokens,
+    )
+
+    model = CostModel(
+        request_dims={
+            "TokensIn": InputTokens(price_per_million=30, granularity=10),
+            "TokensOut": OutputTokens(price_per_million=60),
         },
-        "run_dims": {
-            "ComputeSeconds": {"_type": "EndpointTime", "price_per_hour": 50},
-        },
-    }
-    model = CostModel.from_dict(spec)
-    assert model.request_dims["TokensIn"].price_per_million == 30
-    assert model.run_dims["ComputeSeconds"].price_per_hour == 50
-    assert model.to_dict() == {
-        "_type": "CostModel",
-        "request_dims": {
-            "TokensIn": {
-                "_type": "InputTokens",
-                "price_per_million": 30,
-                "granularity": 1,
-            },
-        },
-        "run_dims": {
-            "ComputeSeconds": {
-                "_type": "EndpointTime",
-                "price_per_hour": 50,
-                "granularity_secs": 1,
-            },
-        },
-    }
+        run_dims={"ComputeSeconds": EndpointTime(price_per_hour=50)},
+    )
+
+    path = tmp_path / "cost_model.json"
+    saved_path = model.save_to_file(path)
+    # save_to_file returns the (validated/normalized) path it wrote to
+    assert str(saved_path) == str(path)
+    assert path.is_file()
+
+    # The file is valid JSON tagged with the CostModel class path
+    with open(path) as f:
+        raw = json.load(f)
+    assert raw["__llmeter_class__"] == "llmeter.callbacks.cost.model.CostModel"
+
+    restored = CostModel.load_from_file(path)
+
+    # The correct concrete type is reconstructed from the file
+    assert isinstance(restored, CostModel)
+
+    # Each dimension is re-initialised as the correct type, under the same name, with values intact
+    assert set(restored.request_dims) == {"TokensIn", "TokensOut"}
+    assert set(restored.run_dims) == {"ComputeSeconds"}
+
+    tokens_in = restored.request_dims["TokensIn"]
+    assert isinstance(tokens_in, InputTokens)
+    assert tokens_in.price_per_million == 30
+    assert tokens_in.granularity == 10
+
+    tokens_out = restored.request_dims["TokensOut"]
+    assert isinstance(tokens_out, OutputTokens)
+    assert tokens_out.price_per_million == 60
+
+    compute = restored.run_dims["ComputeSeconds"]
+    assert isinstance(compute, EndpointTime)
+    assert compute.price_per_hour == 50
+
+
+def test_cost_model_load_from_file_dispatches_via_base_class(tmp_path):
+    """load_from_file resolves the concrete type from the file, even when called on Serializable
+
+    The class is detected from the ``__llmeter_class__`` marker rather than the class the
+    classmethod is invoked on, so loading via the base mixin still yields a CostModel.
+    """
+    from llmeter.callbacks.cost.dimensions import InputTokens
+    from llmeter.serialization import Serializable
+
+    model = CostModel(request_dims={"TokensIn": InputTokens(price_per_million=15)})
+
+    path = tmp_path / "cost_model.json"
+    model.save_to_file(path)
+
+    restored = Serializable.load_from_file(path)
+    assert isinstance(restored, CostModel)
+    assert restored.request_dims["TokensIn"].price_per_million == 15
+    assert restored.run_dims == {}
 
 
 def test_cost_model_detects_duplicate_cost_dim_names():
@@ -79,7 +145,7 @@ def test_cost_model_detects_duplicate_cost_dim_names():
 
 @pytest.mark.asyncio
 async def test_cost_model_callback_saves_request_costs():
-    """By default, CostModel callbacks save request cost calculations to InvocationResponse"""
+    """By default, CostModel callbacks save request cost calculations to response.annotations"""
     dummy_req_dim = Mock()
     dummy_req_dim.calculate = AsyncMock(return_value=42)
 
@@ -88,17 +154,54 @@ async def test_cost_model_callback_saves_request_costs():
         run_dims=[],
     )
 
-    response_mock = NonCallableMock()
-    assert await model.after_invoke(response_mock) is None
-    assert response_mock.cost_total == 42
-    assert response_mock.cost_Mock == 42  # Class name is the default dimension name
+    response = InvocationResponse(response_text="hi")
+    assert await model.after_invoke(response) is None
+    # Costs are stored in the (persisted) annotations dict, not as loose attributes
+    assert response.annotations["cost_total"] == 42
+    assert (
+        response.annotations["cost_Mock"] == 42
+    )  # Class name is the default dimension name
 
     # Check calculate_* fn produces same result as callback:
     assert await model.calculate_request_cost(
-        response_mock
+        response
     ) == CalculatedCostWithDimensions.load_from_namespace(
-        response_mock, key_prefix="cost_"
+        response.annotations, key_prefix="cost_"
     )
+
+
+@pytest.mark.asyncio
+async def test_cost_model_request_costs_survive_response_roundtrip():
+    """Per-response costs saved by CostModel persist through InvocationResponse to_json/from_json.
+
+    This is the behavior that regressed when response serialization moved to ``asdict`` (which
+    drops loose attributes): costs stored in ``annotations`` must round-trip so a saved Result can
+    be reloaded with its per-request costs intact.
+    """
+    from llmeter.callbacks.cost.dimensions import InputTokens, OutputTokens
+
+    model = CostModel(
+        request_dims=[
+            InputTokens(price_per_million=3.0),
+            OutputTokens(price_per_million=15.0),
+        ]
+    )
+    response = InvocationResponse(
+        response_text="hello", num_tokens_input=1000, num_tokens_output=500
+    )
+    await model.after_invoke(response)
+    assert response.annotations["cost_total"] == pytest.approx(0.003 + 0.0075)
+
+    # Round-trip through JSON (what gets written to responses.jsonl)
+    restored = InvocationResponse.from_json(response.to_json())
+    assert restored.annotations == response.annotations
+
+    # ...and the cost model can read the costs back off the restored response
+    reloaded = CalculatedCostWithDimensions.load_from_namespace(
+        restored.annotations, key_prefix="cost_"
+    )
+    assert reloaded["InputTokens"] == pytest.approx(0.003)
+    assert reloaded["OutputTokens"] == pytest.approx(0.0075)
 
 
 @pytest.mark.asyncio
@@ -152,13 +255,17 @@ async def test_cost_model_combines_req_and_run_dims():
     # Run the dummy test:
     run_mock = NonCallableMock()
     await model.before_run(run_mock)
-    response_mocks = [NonCallableMock(), NonCallableMock(), NonCallableMock()]
-    for r in response_mocks:
+    responses = [
+        InvocationResponse(response_text="a"),
+        InvocationResponse(response_text="b"),
+        InvocationResponse(response_text="c"),
+    ]
+    for r in responses:
         await model.after_invoke(r)
     results_mock = NonCallableMock()
     update_contrib_stats_mock = Mock()
     results_mock._update_contributed_stats = update_contrib_stats_mock
-    results_mock.responses = response_mocks
+    results_mock.responses = responses
     results_mock.additional_metrics_for_aggregation = None
     await model.after_run(results_mock)
 

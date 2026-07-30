@@ -23,6 +23,7 @@ from upath import UPath as Path
 from upath.types import ReadablePathLike, WritablePathLike
 
 from .live_display import LiveStatsDisplay
+from .serialization import dump_object, json_default, load_object
 from .utils import RunningStats, ensure_path, now_utc
 
 if TYPE_CHECKING:
@@ -30,7 +31,6 @@ if TYPE_CHECKING:
     from .callbacks.base import Callback
 
 from .endpoints.base import Endpoint, InvocationResponse
-from .json_utils import llmeter_default_serializer
 from .prompt_utils import load_payloads, save_payloads
 from .results import Result
 from .tokenizers import DummyTokenizer, Tokenizer
@@ -145,7 +145,15 @@ class _RunConfig:
 
         assert self.endpoint is not None, "Endpoint cannot be None"
         if isinstance(self.endpoint, dict):
-            self._endpoint: Endpoint = Endpoint.load(self.endpoint)
+            if "__llmeter_class__" in self.endpoint:
+                self._endpoint: Endpoint = load_object(self.endpoint)
+            else:
+                # Legacy load path for <=v0.1.12 data files:
+                logger.warning(
+                    "Loading endpoint config from a legacy data format. Support for this will be "
+                    "removed in a future major version.  Consider re-saving the file to update."
+                )
+                self._endpoint = Endpoint.load(self.endpoint)
         else:
             self._endpoint = self.endpoint
 
@@ -155,7 +163,15 @@ class _RunConfig:
         if self.tokenizer is None:
             self.tokenizer = DummyTokenizer()
         if isinstance(self.tokenizer, dict):
-            self._tokenizer: Tokenizer = Tokenizer.load(self.tokenizer)
+            if "__llmeter_class__" in self.tokenizer:
+                self._tokenizer: Tokenizer = load_object(self.tokenizer)
+            else:
+                # Legacy load path for <=v0.1.12 data files:
+                logger.warning(
+                    "Loading tokenizer from a legacy LLMeter data format. Support for this will "
+                    "be removed in a future major version. Consider re-saving the file to update."
+                )
+                self._tokenizer = Tokenizer.load(self.tokenizer)
         else:
             self._tokenizer = self.tokenizer
 
@@ -171,6 +187,9 @@ class _RunConfig:
             file_name: File name to create under `output_path`.
         """
         output_path = ensure_path(output_path or self.output_path)
+        if output_path is None:
+            logger.info("No output_path provided - skipping saving run config")
+            return
         output_path.mkdir(parents=True, exist_ok=True)
         run_config_path = output_path / file_name
 
@@ -180,19 +199,17 @@ class _RunConfig:
             payload_path = save_payloads(self.payload, output_path)
             config_copy.payload = payload_path
 
+        # Serialize callable objects using dump_object
         assert self.endpoint is not None, "Endpoint cannot be None"
-        if not isinstance(self.endpoint, dict):
-            config_copy.endpoint = self.endpoint.to_dict()
+        config_copy.endpoint = dump_object(self._endpoint)
 
-        if not isinstance(self.tokenizer, dict):
-            config_copy.tokenizer = Tokenizer.to_dict(self.tokenizer)
+        config_copy.tokenizer = dump_object(self._tokenizer)
+
+        if self.callbacks:
+            config_copy.callbacks = [dump_object(cb) for cb in self.callbacks]
 
         with run_config_path.open("w") as f:
-            f.write(
-                json.dumps(
-                    asdict(config_copy), default=llmeter_default_serializer, indent=4
-                )
-            )
+            json.dump(asdict(config_copy), f, default=json_default, indent=4)
 
     @classmethod
     def load(cls, load_path: ReadablePathLike, file_name: str = "run_config.json"):
@@ -205,8 +222,28 @@ class _RunConfig:
         load_path = ensure_path(load_path)
         with (load_path / file_name).open() as f:
             config = json.load(f)
-        config["endpoint"] = Endpoint.load(config["endpoint"])
-        config["tokenizer"] = Tokenizer.load(config["tokenizer"])
+
+        # Restore endpoint and tokenizer. Only unwrap the new-format (`__llmeter_class__`) envelope
+        # here; legacy dicts (`endpoint_type` / `tokenizer_module`) are passed through untouched so
+        # `__post_init__` can route them to `Endpoint.load` / `Tokenizer.load`.
+        ep = config.get("endpoint")
+        if isinstance(ep, dict) and "__llmeter_class__" in ep:
+            config["endpoint"] = load_object(ep)
+
+        tok = config.get("tokenizer")
+        if isinstance(tok, dict) and "__llmeter_class__" in tok:
+            config["tokenizer"] = load_object(tok)
+
+        # Restore callbacks (new-format envelopes only; anything else is left as-is)
+        cbs = config.get("callbacks")
+        if isinstance(cbs, list):
+            config["callbacks"] = [
+                load_object(cb)
+                if isinstance(cb, dict) and "__llmeter_class__" in cb
+                else cb
+                for cb in cbs
+            ]
+
         return cls(**config)
 
 

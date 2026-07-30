@@ -8,12 +8,14 @@ You can also use these classes to implement your own custom `Endpoint` integrati
 import copy
 import functools
 import importlib
+import inspect
 import json
 import logging
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Generic, TypeVar
 from uuid import uuid4
@@ -21,7 +23,13 @@ from uuid import uuid4
 from upath import UPath as Path
 from upath.types import ReadablePathLike, WritablePathLike
 
-from ..json_utils import llmeter_bytes_decoder, llmeter_default_serializer
+from ..serialization import (
+    Serializable,
+    bytes_decoder,
+    json_default,
+    load_object,
+    restore_dataclass_types,
+)
 from ..utils import ensure_path
 
 logger = logging.getLogger(__name__)
@@ -50,6 +58,12 @@ class InvocationResponse:
         time_per_output_token (float): The average time taken to generate each token in the response.
         error (str): Any error that occurred during invocation.
         request_time: The wall-clock time when the request was sent.
+        annotations (dict): Free-form extra data attached to this response, for example by
+            callbacks. This is the **preferred** place for a `Callback` to store additional
+            per-response fields (rather than setting arbitrary attributes on the response), because
+            `annotations` is a declared field and therefore round-trips through
+            `to_json`/`from_json` and disk persistence. On load, any *unrecognized* top-level keys
+            (e.g. from older files or other LLMeter versions) are collected into `annotations` too.
     """
 
     response_text: str | None
@@ -66,6 +80,7 @@ class InvocationResponse:
     error: str | None = None
     retries: int | None = None
     request_time: datetime | None = None
+    annotations: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, json_str: str) -> "InvocationResponse":
@@ -75,13 +90,18 @@ class InvocationResponse:
         correctly restores types that the default JSON round-trip would leave as strings or marker
         objects:
 
-        * `request_time` is parsed from an ISO-8601 string back to a Python `datetime`
-        * `payload`s containing `bytes` (as `__llmeter_bytes__` markers) are correctly loaded back
-          as bytes.
+        * `datetime`-annotated fields are parsed from ISO-8601 strings back to Python `datetime`
+        * `bytes`-typed fields and `__llmeter_bytes__` markers in nested payloads are restored
+
+        For legacy compatability, any top-level keys that are *not* recognized fields are currently
+        collected into [`annotations`][llmeter.endpoints.base.InvocationResponse] rather than being
+        dropped or raising an error. This supports older files where CostModel callbacks wrote
+        extra fields (such as `cost_*`) directly onto the response - but may be dropped in a future
+        version.
 
         Args:
             json_str: A JSON string representation of an InvocationResponse (produced by `to_json`
-            or similar).
+                or similar).
 
         Returns:
             InvocationResponse: The deserialized response.
@@ -93,16 +113,28 @@ class InvocationResponse:
             restored = InvocationResponse.from_json(original.to_json())
             ```
         """
-        data = json.loads(json_str, object_hook=llmeter_bytes_decoder)
-        rt = data.get("request_time")
-        if rt is not None and isinstance(rt, str):
-            data["request_time"] = datetime.fromisoformat(rt.replace("Z", "+00:00"))
+        data = json.loads(json_str, object_hook=bytes_decoder)
+        restore_dataclass_types(cls, data)
+        # Route any unrecognized top-level keys into `annotations` rather than failing. This keeps
+        # forward/backward compatibility: e.g. older files where callbacks wrote extra fields (like
+        # `cost_*`) directly onto the response, or fields written by a different LLMeter version.
+        known = {f.name for f in fields(cls)}
+        extras = {k: data.pop(k) for k in list(data) if k not in known}
+        if extras:
+            data["annotations"] = {**extras, **(data.get("annotations") or {})}
+            logger.debug(
+                "Loaded %d unrecognized InvocationResponse field(s) into `annotations`: %s",
+                len(extras),
+                ", ".join(sorted(extras)),
+            )
         return cls(**data)
 
-    def to_json(self, default=llmeter_default_serializer, **kwargs) -> str:
+    def to_json(
+        self, default: Callable[[Any], Any] | None = json_default, **kwargs: Any
+    ) -> str:
         """Serialize this response to a JSON string.
 
-        Uses [`llmeter_default_serializer`][llmeter.json_utils.llmeter_default_serializer] by
+        Uses [`json_default`][llmeter.serialization.json_default] by
         default, which handles `bytes`, `datetime`, `PathLike`, and other common non-serializable
         types.
 
@@ -151,7 +183,7 @@ class InvocationResponse:
         `datetime` comparisons and arithmetic.
 
         For JSON output, use [`to_json`][llmeter.endpoints.base.InvocationResponse.to_json], (which
-        delegates to [`llmeter_default_serializer`][llmeter.json_utils.llmeter_default_serializer]
+        delegates to [`json_default`][llmeter.serialization.json_default]
         by default, for non-JSON-serializable data types).
 
         Returns:
@@ -163,7 +195,7 @@ class InvocationResponse:
 TRawResponse = TypeVar("TRawResponse", bound=Any)
 
 
-class Endpoint(ABC, Generic[TRawResponse]):
+class Endpoint(Serializable, ABC, Generic[TRawResponse]):
     """
     An abstract base class for endpoint implementations.
 
@@ -474,23 +506,26 @@ class Endpoint(ABC, Generic[TRawResponse]):
         return NotImplemented
 
     def save(self, output_path: WritablePathLike) -> Path:
-        """
-        Save the endpoint configuration to a JSON file.
+        """Save the endpoint configuration to a JSON file.
 
-        This method serializes the endpoint's configuration (excluding private attributes)
-        to a JSON file at the specified path.
+        .. deprecated::
+            Use :meth:`~llmeter.serialization.Serializable.save_to_file` instead, which
+            provides the same behavior with a consistent name across all serializable
+            LLMeter objects. This alias will be removed in a future major version.
 
         Args:
             output_path (str | UPath): The path where the configuration file will be saved.
 
         Returns:
-            None
+            Path: The path the file was written to.
         """
-        output_path = ensure_path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w") as f:
-            json.dump(self, f, indent=4, default=llmeter_default_serializer)
-        return output_path
+        warnings.warn(
+            "Endpoint.save() is deprecated and will be removed in a future version; "
+            "use Endpoint.save_to_file() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.save_to_file(output_path)
 
     def to_dict(self) -> dict:
         """
@@ -504,41 +539,46 @@ class Endpoint(ABC, Generic[TRawResponse]):
         return endpoint_conf
 
     @classmethod
-    def load_from_file(cls, input_path: ReadablePathLike) -> "Endpoint":
-        """
-        Load an endpoint configuration from a JSON file.
+    def load_from_file(cls, path: ReadablePathLike) -> "Endpoint":
+        """Load an endpoint configuration from a JSON file.
 
         This class method reads a JSON file containing an endpoint configuration,
         determines the appropriate endpoint class, and instantiates it with the
         loaded configuration.
 
         Args:
-            input_path (str|UPath): The path to the JSON configuration file.
+            path (str | UPath): The path to the JSON configuration file.
 
         Returns:
             Endpoint: An instance of the appropriate endpoint class, initialized
                       with the configuration from the file.
         """
-
-        input_path = ensure_path(input_path)
-        with input_path.open("r") as f:
+        path = ensure_path(path)
+        with path.open("r") as f:
             data = json.load(f)
+        if "__llmeter_class__" in data:
+            return load_object(data)
         endpoint_type = data.pop("endpoint_type")
         endpoint_module = importlib.import_module("llmeter.endpoints")
         endpoint_class = getattr(endpoint_module, endpoint_type)
-        return endpoint_class(**data)
+        return endpoint_class(**_filter_legacy_ctor_kwargs(endpoint_class, data))
 
     @classmethod
     def load(cls, endpoint_config: dict) -> "Endpoint":  # type: ignore
-        """
-        Load an endpoint configuration from a dictionary.
+        """Load an endpoint configuration from a dictionary.
 
         This class method reads a dictionary containing an endpoint configuration,
         determines the appropriate endpoint class, and instantiates it with the
         loaded configuration.
 
+        !!! warning "Deprecated"
+            This supports the legacy `{"endpoint_type": ...}` format. New code should
+            use [`load_object`][llmeter.serialization.load_object] with dicts produced by
+            [`dump_object`][llmeter.serialization.dump_object].
+
         Args:
-            endpoint_config (Dict): A dictionary containing the endpoint configuration.
+            endpoint_config (dict): A dictionary containing the endpoint configuration.
+                Must include at minimum an `endpoint_type` key.
 
         Returns:
             Endpoint: An instance of the appropriate endpoint class, initialized
@@ -547,4 +587,37 @@ class Endpoint(ABC, Generic[TRawResponse]):
         endpoint_type = endpoint_config.pop("endpoint_type")
         endpoint_module = importlib.import_module("llmeter.endpoints")
         endpoint_class = getattr(endpoint_module, endpoint_type)
-        return endpoint_class(**endpoint_config)
+        return endpoint_class(
+            **_filter_legacy_ctor_kwargs(endpoint_class, endpoint_config)
+        )
+
+
+def _filter_legacy_ctor_kwargs(endpoint_class: type, config: dict) -> dict:
+    """Drop legacy config keys that the target endpoint constructor won't accept.
+
+    Older LLMeter configs persisted derived/read-only attributes (notably `provider`, which
+    endpoints now set internally) alongside the real constructor arguments. Passing those through
+    to a modern `__init__` raises `TypeError`, so we filter the dict down to the parameters the
+    constructor actually declares.
+
+    If the constructor accepts `**kwargs` the dict is passed through unchanged.
+
+    Args:
+        endpoint_class: The endpoint class about to be instantiated.
+        config: The legacy configuration dict (already stripped of ``endpoint_type``).
+
+    Returns:
+        A copy of `config` containing only keys the constructor accepts.
+    """
+    params = inspect.signature(endpoint_class.__init__).parameters
+    if any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return config
+    accepted = {name for name in params if name != "self"}
+    dropped = set(config) - accepted
+    if dropped:
+        logger.debug(
+            "Ignoring legacy config field(s) not accepted by %s.__init__: %s",
+            endpoint_class.__name__,
+            ", ".join(sorted(dropped)),
+        )
+    return {k: v for k, v in config.items() if k in accepted}

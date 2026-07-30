@@ -58,6 +58,8 @@ class BedrockInvokeBase(
         self.generated_token_count_jmespath = generated_token_count_jmespath
         self.input_text_jmespath = input_text_jmespath
         self.input_token_count_jmespath = input_token_count_jmespath
+        # Persist extra config on the class just so de/serialization catches it:
+        self._max_attempts = max_attempts
 
         self.region = (
             region
@@ -348,7 +350,7 @@ class BedrockInvokeStream(
         """Parse the streaming response from Bedrock InvokeModelWithResponseStream API.
 
         Args:
-            client_response: The raw response from the Bedrock API.
+            raw_response: The raw response from the Bedrock API.
             start_t: The timestamp when the request was initiated.
 
         Returns:
