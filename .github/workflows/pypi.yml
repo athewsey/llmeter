@@ -6,6 +6,7 @@ on:
     # lines, add them to the workflow filters:
     tags:
       - 'v0.1.*'
+      - 'v0.2.*'
 
 permissions:
   contents: read
