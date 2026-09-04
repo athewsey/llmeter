@@ -84,7 +84,7 @@ def aws_region():
 @pytest.fixture(scope="session")
 def bedrock_test_model():
     """
-    Get test model ID for Converse/Invoke tests.
+    Get standard test model ID for Converse/Invoke tests.
 
     The model ID can be overridden via the BEDROCK_TEST_MODEL environment variable.
     Defaults to Nova 2 Lite, which is widely available and cost-effective.
@@ -93,6 +93,20 @@ def bedrock_test_model():
         str: Bedrock model ID for testing.
     """
     return os.environ.get("BEDROCK_TEST_MODEL", "global.amazon.nova-2-lite-v1:0")
+
+
+@pytest.fixture(scope="session")
+def bedrock_caching_test_model():
+    """
+    Get test model ID for Converse/Invoke tests.
+
+    The model ID can be overridden via the BEDROCK_CACHING_TEST_MODEL environment variable.
+    Defaults to Claude Haiku 4.5, since Nova models don't yet support caching at writing.
+
+    Returns:
+        str: Bedrock model ID for testing.
+    """
+    return os.environ.get("BEDROCK_CACHING_TEST_MODEL", "us.anthropic.claude-sonnet-5")
 
 
 @pytest.fixture(scope="session")

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from io import BytesIO
 from unittest.mock import patch
 
 import pytest
@@ -117,6 +118,37 @@ def test_sagemaker_endpoint_invoke(sagemaker_endpoint: SageMakerEndpoint):
     assert response.num_tokens_output == 10
     assert isinstance(response.id, str)
     assert len(response.id) > 0
+
+
+@patch("time.perf_counter")
+def test_sagemaker_endpoint_time_to_last_token_is_elapsed(
+    mock_perf_counter, sagemaker_endpoint: SageMakerEndpoint
+):
+    """TTLT must be a duration relative to `start_t`, not a raw perf_counter reading.
+
+    Regression test: `process_raw_response` previously assigned `time.perf_counter()`
+    without subtracting `start_t`, so `SageMakerEndpoint` reported an absolute clock
+    value (time since boot) instead of the request latency.
+    """
+    start_t = 100.0
+    mock_perf_counter.return_value = 100.25
+
+    raw_response = {
+        "Body": BytesIO(
+            json.dumps(
+                {
+                    "generated_text": "Test output",
+                    "details": {"generated_tokens": 10},
+                }
+            ).encode("utf-8")
+        )
+    }
+
+    response = InvocationResponse(response_text=None)
+    sagemaker_endpoint.process_raw_response(raw_response, start_t, response)
+
+    assert response.time_to_last_token is not None
+    assert abs(response.time_to_last_token - 0.25) < 1e-5
 
 
 # @patch("boto3.client")

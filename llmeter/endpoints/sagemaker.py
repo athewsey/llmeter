@@ -210,7 +210,7 @@ class SageMakerEndpoint(SageMakerBase[InvokeEndpointOutputTypeDef]):
         start_t: float,
         response: InvocationResponse,
     ) -> None:
-        response.time_to_last_token = time.perf_counter()
+        response.time_to_last_token = time.perf_counter() - start_t
 
         if raw_response is None:
             response.error = "Null response from SageMaker endpoint"
