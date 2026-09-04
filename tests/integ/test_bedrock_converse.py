@@ -321,7 +321,7 @@ def test_bedrock_converse_streaming_with_image(
 
 @pytest.mark.integ
 def test_bedrock_converse_streaming_prompt_caching(
-    aws_credentials, aws_region, bedrock_test_model
+    aws_credentials, aws_region, bedrock_caching_test_model
 ):
     """Test that BedrockConverseStream captures prompt caching metrics.
 
@@ -349,7 +349,9 @@ def test_bedrock_converse_streaming_prompt_caching(
 
     from llmeter.endpoints.bedrock import BedrockConverseStream
 
-    endpoint = BedrockConverseStream(model_id=bedrock_test_model, region=aws_region)
+    endpoint = BedrockConverseStream(
+        model_id=bedrock_caching_test_model, region=aws_region
+    )
 
     # Unique prefix per test run to avoid accidental cache hits from previous runs.
     run_id = uuid4().hex
@@ -384,34 +386,50 @@ def test_bedrock_converse_streaming_prompt_caching(
     assert response1.error is None, f"First call should not error: {response1.error}"
     assert response1.response_text, "First call should return text"
 
-    # num_tokens_input_cached should be present (may be 0 on cache write)
-    assert response1.num_tokens_input_cached is not None, (
-        "Response should include num_tokens_input_cached field"
-    )
+    # We used to assert that num_tokens_input_cached should be present (even if 0)
+    # here, but seems like on newer models it can be missing.
+
 
     # Brief pause to allow cache propagation
     time.sleep(1)
 
-    # Second call with same system prefix: should read from cache
-    payload_2 = {
-        **payload,
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"text": "Say goodbye in one word."}],
-            }
-        ],
-    }
-    response2 = endpoint.invoke(payload_2)
-    assert response2.error is None, f"Second call should not error: {response2.error}"
-    assert response2.response_text, "Second call should return text"
+    # Allow a few attempts to account for non-100% cache hit rate:
+    max_attempts = 5
+    n_errors = 0
+    last_error = None
+    for ix_attempt in range(1, max_attempts + 1):
+        # Follow-up call with same system prefix: should read from cache
+        payload_2 = {
+            **payload,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"text": "Say goodbye in one word."}],
+                }
+            ],
+        }
+        response2 = endpoint.invoke(payload_2)
+        if response2.error is not None:
+            n_errors += 1
+            last_error = response2.error
+            print(f"Attempt {ix_attempt} got ERROR:\n{last_error}")
 
-    assert response2.num_tokens_input_cached is not None, (
-        "Second call should report num_tokens_input_cached"
+        if (
+            response2.num_tokens_input_cached is not None
+            and response2.num_tokens_input_cached > 0
+        ):
+            assert response2.response_text, (
+                "Follow-up call used cache but returned no text"
+            )
+            # Success
+            return
+        time.sleep(2)
+
+    # If we get here, none of our attempts used the cache
+    assert n_errors < max_attempts, (
+        f"All cache re-use attempts failed with errors. Last error:\n{last_error}"
     )
-    assert response2.num_tokens_input_cached > 0, (
-        f"Expected cached tokens > 0 on cache hit, got {response2.num_tokens_input_cached}"
-    )
+    assert False, f"Failed to hit cache after {max_attempts} attempts"
 
 
 def test_save_load_payload_with_image(test_payload_with_image, tmp_path):
@@ -607,7 +625,7 @@ def test_save_load_multiple_images(tmp_path):
 
 @pytest.mark.integ
 def test_round_trip_bedrock_converse_structure(
-    test_payload_with_image, tmp_path, aws_credentials, aws_region
+    test_payload_with_image, tmp_path, aws_credentials, aws_region, bedrock_test_model
 ):
     """
     Test round-trip serialization with actual Bedrock Converse API structure.
@@ -632,7 +650,7 @@ def test_round_trip_bedrock_converse_structure(
 
     # Create a complete Bedrock Converse payload with all typical fields
     complete_payload = {
-        "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
+        "modelId": bedrock_test_model,
         "messages": test_payload_with_image["messages"],
         "inferenceConfig": {
             "maxTokens": 150,
