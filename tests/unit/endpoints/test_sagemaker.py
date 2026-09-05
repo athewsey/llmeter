@@ -248,3 +248,49 @@ def test_token_iterator_error_handling():
         next(iterator)
 
     assert str(exc_info.value) == "Test error"
+
+
+def _payload_stream(lines: list[str]):
+    """Wrap raw SSE lines as SageMaker `PayloadPart` events."""
+    return [{"PayloadPart": {"Bytes": (ln + "\n").encode("utf-8")}} for ln in lines]
+
+
+def test_token_iterator_rejects_chat_completions_schema_with_actionable_error():
+    """A non-TGI chunk must fail with an explanation, not a bare `KeyError: 'token'`.
+
+    SageMaker only transports bytes -- the schema is the container's. LMI and the `/openai/v1`
+    endpoint path both serve OpenAI Chat Completions, which this parser cannot read.
+    """
+    chunk = json.dumps({"choices": [{"delta": {"content": "Hi"}}]})
+    iterator = TokenIterator(_payload_stream([f"data:{chunk}"]))
+
+    with pytest.raises(ValueError) as exc_info:
+        next(iterator)
+
+    message = str(exc_info.value)
+    assert "TGI schema" in message
+    assert "choices" in message, "Error should report the keys actually present"
+    assert "OpenAICompletionStreamEndpoint" in message, (
+        "Error should point at the connector that can read this schema"
+    )
+
+
+def test_token_iterator_reasoning_chunk_also_reports_clearly():
+    """A reasoning-carrying Chat Completions chunk fails the same diagnosable way."""
+    chunk = json.dumps({"choices": [{"delta": {"reasoning_content": "thinking"}}]})
+    iterator = TokenIterator(_payload_stream([f"data:{chunk}"]))
+
+    with pytest.raises(ValueError, match="TGI schema"):
+        next(iterator)
+
+
+def test_token_iterator_still_parses_tgi_schema():
+    """The supported schema must keep working unchanged."""
+    lines = [
+        'data:{"token": {"text": "Hello"}}',
+        'data:{"token": {"text": " world"}, "details": {"generated_tokens": 2}}',
+    ]
+    iterator = TokenIterator(_payload_stream(lines))
+
+    assert list(iterator) == ["Hello", " world"]
+    assert iterator.details == {"generated_tokens": 2}

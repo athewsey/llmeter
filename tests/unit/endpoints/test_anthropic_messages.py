@@ -3,8 +3,10 @@
 
 # Python Built-Ins:
 from pathlib import Path
+import json
 import tempfile
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 # External Dependencies:
@@ -17,6 +19,7 @@ from llmeter.endpoints.anthropic_messages import (
     AnthropicMessagesEndpoint,
     AnthropicMessagesStream,
 )
+from llmeter.endpoints.anthropic_messages import _extract_thinking_tokens
 from llmeter.endpoints.base import InvocationResponse
 
 _PATCH_CLIENTS = "llmeter.endpoints.anthropic_messages._ANTHROPIC_CLIENTS"
@@ -119,6 +122,32 @@ def _make_stream_events(
 def _make_draft_response() -> InvocationResponse:
     """Create a draft InvocationResponse like llmeter_invoke does."""
     return InvocationResponse(response_text=None)
+
+
+def _message_start_event(msg_id="msg_1", input_tokens=5, cache_read_input_tokens=None):
+    """Build a single mock `message_start` event."""
+    event = Mock()
+    event.type = "message_start"
+    event.message = Mock()
+    event.message.id = msg_id
+    event.message.usage = Mock()
+    event.message.usage.input_tokens = input_tokens
+    event.message.usage.cache_read_input_tokens = cache_read_input_tokens
+    return event
+
+
+def _delta_event(delta_type: str, **delta_attrs):
+    """Build a single mock `content_block_delta` event of the given delta type.
+
+    Example: ``_delta_event("text_delta", text="Hi")``
+    """
+    event = Mock()
+    event.type = "content_block_delta"
+    event.delta = Mock()
+    event.delta.type = delta_type
+    for name, value in delta_attrs.items():
+        setattr(event.delta, name, value)
+    return event
 
 
 @pytest.fixture()
@@ -518,168 +547,105 @@ class TestAnthropicMessagesStream:
         assert response.response_text == "Answer"
         assert response.num_tokens_output == 3
 
-    def test_ttft_visible_tokens_only_true_ignores_thinking(self, mock_client):
-        """With ttft_visible_tokens_only=True (default), TTFT is set on first text_delta."""
+    def test_ttft_includes_thinking_delta(self, mock_client):
+        """A thinking_delta is a real output token, so it sets TTFT but not the content TTFT."""
         endpoint = AnthropicMessagesStream(model_id="test-model")
 
-        events = []
-
-        msg_start = Mock()
-        msg_start.type = "message_start"
-        msg_start.message = Mock()
-        msg_start.message.id = "msg_1"
-        msg_start.message.usage = Mock()
-        msg_start.message.usage.input_tokens = 5
-        msg_start.message.usage.cache_read_input_tokens = None
-        events.append(msg_start)
-
-        # Thinking delta — should NOT set TTFT
-        thinking = Mock()
-        thinking.type = "content_block_delta"
-        thinking.delta = Mock()
-        thinking.delta.type = "thinking_delta"
-        thinking.delta.thinking = "Reasoning..."
-        events.append(thinking)
-
-        # Text delta — should set TTFT
-        text = Mock()
-        text.type = "content_block_delta"
-        text.delta = Mock()
-        text.delta.type = "text_delta"
-        text.delta.text = "Result"
-        events.append(text)
+        events = [
+            _message_start_event(),
+            _delta_event("thinking_delta", thinking="Reasoning..."),
+            _delta_event("text_delta", text="Result"),
+        ]
 
         response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(iter(events), start_t, response)
+        with patch("time.perf_counter") as clock:
+            # message_start, thinking_delta, text_delta
+            clock.side_effect = [100.1, 100.4, 100.9]
+            endpoint.process_raw_response(iter(events), 100.0, response)
 
-        assert response.time_to_first_token is not None
+        assert response.time_to_first_token == pytest.approx(0.4)
+        assert response.time_to_first_content_token == pytest.approx(0.9)
         assert response.response_text == "Result"
 
-    def test_ttft_visible_tokens_only_false_includes_thinking(self, mock_client):
-        """With ttft_visible_tokens_only=False, TTFT is set on first thinking_delta."""
-        endpoint = AnthropicMessagesStream(
-            model_id="test-model", ttft_visible_tokens_only=False
-        )
+    def test_ttft_equals_content_ttft_without_thinking(self, mock_client):
+        """With no thinking, both first-token metrics describe the same token."""
+        endpoint = AnthropicMessagesStream(model_id="test-model")
 
-        events = []
-
-        msg_start = Mock()
-        msg_start.type = "message_start"
-        msg_start.message = Mock()
-        msg_start.message.id = "msg_1"
-        msg_start.message.usage = Mock()
-        msg_start.message.usage.input_tokens = 5
-        msg_start.message.usage.cache_read_input_tokens = None
-        events.append(msg_start)
-
-        # Thinking delta — should set TTFT
-        thinking = Mock()
-        thinking.type = "content_block_delta"
-        thinking.delta = Mock()
-        thinking.delta.type = "thinking_delta"
-        thinking.delta.thinking = "Reasoning..."
-        events.append(thinking)
-
-        # Text delta — TTFT already set, should not change it
-        text = Mock()
-        text.type = "content_block_delta"
-        text.delta = Mock()
-        text.delta.type = "text_delta"
-        text.delta.text = "Result"
-        events.append(text)
+        events = [
+            _message_start_event(),
+            _delta_event("text_delta", text="Result"),
+        ]
 
         response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(iter(events), start_t, response)
+        endpoint.process_raw_response(iter(events), time.perf_counter(), response)
 
-        # TTFT was set on the thinking delta, before the text delta
         assert response.time_to_first_token is not None
-        assert response.time_to_first_token <= response.time_to_last_token
-        assert response.response_text == "Result"
+        assert response.time_to_first_token == response.time_to_first_content_token
 
-    def test_ttft_signature_delta_with_display_omitted(self, mock_client):
-        """With display=omitted, no thinking_delta is emitted — only signature_delta.
+    def test_thinking_deltas_do_not_set_content_ttft(self, mock_client):
+        """A thinking-only response has no visible content token to time."""
+        endpoint = AnthropicMessagesStream(model_id="test-model")
 
-        When ttft_visible_tokens_only=False, the signature_delta should set TTFT.
+        events = [
+            _message_start_event(),
+            _delta_event("thinking_delta", thinking="Reasoning..."),
+        ]
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(iter(events), time.perf_counter(), response)
+
+        assert response.time_to_first_token is not None
+        assert response.time_to_first_content_token is None
+        assert response.response_text is None
+
+    def test_display_omitted_reports_no_ttft(self, mock_client):
+        """With display=omitted the first token is unobservable, so TTFT must be None.
+
+        Only a signature_delta precedes the text, and it is emitted *after* thinking finishes.
+        Reporting it (or the text delta) as TTFT would be wrong, so we report nothing.
         """
-        endpoint = AnthropicMessagesStream(
-            model_id="test-model", ttft_visible_tokens_only=False
-        )
-
-        events = []
-
-        msg_start = Mock()
-        msg_start.type = "message_start"
-        msg_start.message = Mock()
-        msg_start.message.id = "msg_1"
-        msg_start.message.usage = Mock()
-        msg_start.message.usage.input_tokens = 5
-        msg_start.message.usage.cache_read_input_tokens = None
-        events.append(msg_start)
-
-        # signature_delta — the only thinking-block signal in omitted mode
-        sig = Mock()
-        sig.type = "content_block_delta"
-        sig.delta = Mock()
-        sig.delta.type = "signature_delta"
-        sig.delta.signature = "EosnCkYICxIMMb3LzNrMu..."
-        events.append(sig)
-
-        # Text delta
-        text = Mock()
-        text.type = "content_block_delta"
-        text.delta = Mock()
-        text.delta.type = "text_delta"
-        text.delta.text = "Answer"
-        events.append(text)
-
-        response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(iter(events), start_t, response)
-
-        # TTFT was set on the signature_delta, not the text_delta
-        assert response.time_to_first_token is not None
-        assert response.time_to_first_token <= response.time_to_last_token
-        assert response.response_text == "Answer"
-
-    def test_ttft_signature_delta_ignored_when_visible_only(self, mock_client):
-        """With ttft_visible_tokens_only=True (default), signature_delta is ignored for TTFT."""
         endpoint = AnthropicMessagesStream(model_id="test-model")
 
-        events = []
-
-        msg_start = Mock()
-        msg_start.type = "message_start"
-        msg_start.message = Mock()
-        msg_start.message.id = "msg_1"
-        msg_start.message.usage = Mock()
-        msg_start.message.usage.input_tokens = 5
-        msg_start.message.usage.cache_read_input_tokens = None
-        events.append(msg_start)
-
-        # signature_delta — should NOT set TTFT
-        sig = Mock()
-        sig.type = "content_block_delta"
-        sig.delta = Mock()
-        sig.delta.type = "signature_delta"
-        sig.delta.signature = "EosnCkYICxIMMb3LzNrMu..."
-        events.append(sig)
-
-        # Text delta — should set TTFT
-        text = Mock()
-        text.type = "content_block_delta"
-        text.delta = Mock()
-        text.delta.type = "text_delta"
-        text.delta.text = "Answer"
-        events.append(text)
+        events = [
+            _message_start_event(),
+            _delta_event("signature_delta", signature="EosnCkYICxIMMb3LzNrMu..."),
+            _delta_event("text_delta", text="Answer"),
+        ]
 
         response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(iter(events), start_t, response)
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.1, 100.6, 100.8]
+            endpoint.process_raw_response(iter(events), 100.0, response)
 
-        assert response.time_to_first_token is not None
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token == pytest.approx(0.8)
         assert response.response_text == "Answer"
+        # The signature time is preserved, but only as an annotation
+        assert response.annotations[
+            "anthropic_time_to_thinking_signature"
+        ] == pytest.approx(0.6)
+
+    def test_display_summarized_keeps_ttft_despite_signature(self, mock_client):
+        """A signature_delta must not suppress TTFT when thinking deltas were also streamed."""
+        endpoint = AnthropicMessagesStream(model_id="test-model")
+
+        events = [
+            _message_start_event(),
+            _delta_event("thinking_delta", thinking="Reasoning..."),
+            _delta_event("signature_delta", signature="EosnCkYICxIMMb3LzNrMu..."),
+            _delta_event("text_delta", text="Answer"),
+        ]
+
+        response = _make_draft_response()
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.1, 100.3, 100.6, 100.8]
+            endpoint.process_raw_response(iter(events), 100.0, response)
+
+        assert response.time_to_first_token == pytest.approx(0.3)
+        assert response.time_to_first_content_token == pytest.approx(0.8)
+        assert response.annotations[
+            "anthropic_time_to_thinking_signature"
+        ] == pytest.approx(0.6)
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +813,6 @@ class TestAnthropicSerialization:
             original = AnthropicMessagesStream(
                 model_id="claude-opus-4-7",
                 api_key="test",
-                ttft_visible_tokens_only=False,
                 max_retries=4,
             )
             path = Path(tmpdir) / "endpoint.json"
@@ -856,8 +821,46 @@ class TestAnthropicSerialization:
             loaded = Endpoint.load_from_file(path)
 
             assert isinstance(loaded, AnthropicMessagesStream)
-            assert loaded.ttft_visible_tokens_only is False
+            assert loaded.model_id == "claude-opus-4-7"
             assert loaded._client.max_retries == 4
+
+    def test_saved_config_omits_deprecated_ttft_flag(self):
+        """Newly-saved configs should not carry the retired flag forward."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7", api_key="k")
+            path = Path(tmpdir) / "endpoint.json"
+            endpoint.save_to_file(path)
+
+            state = json.loads(path.read_text())["__llmeter_state__"]
+
+        assert state.get("ttft_visible_tokens_only") is None
+
+    def test_legacy_config_with_ttft_flag_still_loads(self):
+        """A config saved by an older LLMeter version must still load, with a warning."""
+        from llmeter.endpoints.base import Endpoint
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "endpoint.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "__llmeter_class__": "llmeter.endpoints.anthropic_messages.AnthropicMessagesStream",
+                        "__llmeter_state__": {
+                            "model_id": "claude-opus-4-7",
+                            "endpoint_name": "anthropic-messages",
+                            "provider": "anthropic",
+                            "api_key": "test",
+                            "ttft_visible_tokens_only": True,
+                        },
+                    }
+                )
+            )
+
+            with pytest.warns(DeprecationWarning, match="ttft_visible_tokens_only"):
+                loaded = Endpoint.load_from_file(path)
+
+        assert isinstance(loaded, AnthropicMessagesStream)
+        assert loaded.model_id == "claude-opus-4-7"
 
     def test_round_trip_with_granular_timeout(self):
         """Test httpx.Timeout round-trips correctly through dict serialization."""
@@ -877,3 +880,221 @@ class TestAnthropicSerialization:
             loaded = Endpoint.load_from_file(path)
 
             assert loaded._client.timeout == httpx.Timeout(10.0, connect=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: thinking-token accounting
+# ---------------------------------------------------------------------------
+
+
+class TestExtractThinkingTokens:
+    """`output_tokens_details` can arrive as a modelled object or a plain dict."""
+
+    def test_modelled_object_shape(self):
+        """Newer anthropic SDKs model the field, so it has attribute access."""
+        usage = SimpleNamespace(
+            output_tokens=100,
+            output_tokens_details=SimpleNamespace(thinking_tokens=42),
+        )
+        assert _extract_thinking_tokens(usage) == 42
+
+    def test_plain_dict_shape(self):
+        """Older SDKs don't model it, so pydantic keeps it as a dict in `model_extra`."""
+        usage = SimpleNamespace(
+            output_tokens=100, output_tokens_details={"thinking_tokens": 42}
+        )
+        assert _extract_thinking_tokens(usage) == 42
+
+    def test_real_sdk_roundtrip(self):
+        """Guard against SDK-version drift in how the extra field is surfaced."""
+        from anthropic.types import Usage
+
+        usage = Usage.model_validate(
+            {
+                "input_tokens": 10,
+                "output_tokens": 100,
+                "output_tokens_details": {"thinking_tokens": 42},
+            }
+        )
+        assert _extract_thinking_tokens(usage) == 42
+
+    def test_zero_is_preserved(self):
+        """0 means 'known to be no thinking', which is different from None."""
+        usage = SimpleNamespace(output_tokens_details={"thinking_tokens": 0})
+        assert _extract_thinking_tokens(usage) == 0
+
+    def test_absent_details(self):
+        assert _extract_thinking_tokens(SimpleNamespace(output_tokens=100)) is None
+
+    def test_null_details(self):
+        usage = SimpleNamespace(output_tokens=100, output_tokens_details=None)
+        assert _extract_thinking_tokens(usage) is None
+
+    def test_details_without_thinking_tokens(self):
+        usage = SimpleNamespace(output_tokens_details={"something_else": 1})
+        assert _extract_thinking_tokens(usage) is None
+
+    def test_non_integer_value_rejected(self):
+        """A Mock or other placeholder must not be mistaken for a count."""
+        usage = SimpleNamespace(output_tokens_details=Mock())
+        assert _extract_thinking_tokens(usage) is None
+
+    def test_bool_rejected(self):
+        usage = SimpleNamespace(output_tokens_details={"thinking_tokens": True})
+        assert _extract_thinking_tokens(usage) is None
+
+
+class TestThinkingTokenAccounting:
+    def test_non_streaming_reports_thinking_tokens(self, mock_client):
+        endpoint = AnthropicMessages(model_id="test-model")
+
+        text_block = Mock()
+        text_block.type = "text"
+        text_block.text = "Answer"
+        message = Mock()
+        message.id = "msg_1"
+        message.content = [text_block]
+        message.usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=100,
+            cache_read_input_tokens=None,
+            output_tokens_details={"thinking_tokens": 60},
+        )
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(message, time.perf_counter(), response)
+
+        assert response.num_tokens_output == 100
+        assert response.num_tokens_output_reasoning == 60
+
+    def test_streaming_reports_thinking_tokens(self, mock_client):
+        endpoint = AnthropicMessagesStream(model_id="test-model")
+
+        msg_delta = Mock()
+        msg_delta.type = "message_delta"
+        msg_delta.usage = SimpleNamespace(
+            output_tokens=100, output_tokens_details={"thinking_tokens": 60}
+        )
+
+        events = [
+            _message_start_event(),
+            _delta_event("thinking_delta", thinking="hmm"),
+            _delta_event("text_delta", text="Answer"),
+            msg_delta,
+        ]
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(iter(events), time.perf_counter(), response)
+
+        assert response.num_tokens_output == 100
+        assert response.num_tokens_output_reasoning == 60
+
+    def test_streaming_without_breakdown_leaves_none(self, mock_client):
+        """An API response with no `output_tokens_details` must not invent a value."""
+        endpoint = AnthropicMessagesStream(model_id="test-model")
+
+        msg_delta = Mock()
+        msg_delta.type = "message_delta"
+        msg_delta.usage = SimpleNamespace(output_tokens=100)
+
+        events = [
+            _message_start_event(),
+            _delta_event("text_delta", text="Answer"),
+            msg_delta,
+        ]
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(iter(events), time.perf_counter(), response)
+
+        assert response.num_tokens_output == 100
+        assert response.num_tokens_output_reasoning is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: omitted-mode thinking, end to end through endpoint + Runner
+# ---------------------------------------------------------------------------
+
+
+class TestOmittedThinkingTpotRecovery:
+    """`display: "omitted"` loses TTFT but must still yield TPOT.
+
+    Unlike the arithmetic-only cases in
+    ``tests/unit/test_runner.py::TestComputeTimePerOutputToken``, this drives the real endpoint
+    parser so the whole chain is covered: the stream shape produces `time_to_first_token=None`,
+    `usage.output_tokens_details.thinking_tokens` populates `num_tokens_output_reasoning`, and the
+    Runner then derives TPOT from those. A regression in any one of the three breaks this.
+    """
+
+    @staticmethod
+    def _omitted_mode_events(thinking_tokens: int | None):
+        """Build the event sequence a `display: "omitted"` request produces.
+
+        No `thinking_delta` is streamed -- only a `signature_delta`, after thinking completes.
+        """
+        usage = SimpleNamespace(output_tokens=100)
+        if thinking_tokens is not None:
+            usage = SimpleNamespace(
+                output_tokens=100,
+                output_tokens_details={"thinking_tokens": thinking_tokens},
+            )
+        msg_delta = Mock()
+        msg_delta.type = "message_delta"
+        msg_delta.usage = usage
+
+        return [
+            _message_start_event(),
+            _delta_event("signature_delta", signature="EosnCkYICxIMMb3LzNrMu..."),
+            _delta_event("text_delta", text="55"),
+            _delta_event("text_delta", text="5"),
+            msg_delta,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tpot_derived_without_ttft(self, mock_client):
+        from llmeter.runner import _Run
+
+        endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7")
+        response = _make_draft_response()
+
+        with patch("time.perf_counter") as clock:
+            # message_start, signature_delta, text_delta, text_delta, message_delta
+            clock.side_effect = [100.1, 100.5, 102.0, 105.0, 106.0]
+            endpoint.process_raw_response(
+                iter(self._omitted_mode_events(thinking_tokens=60)), 100.0, response
+            )
+
+        # Endpoint: TTFT unmeasurable, but the reasoning split is reported
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token == pytest.approx(2.0)
+        assert response.time_to_last_token == pytest.approx(5.0)
+        assert response.num_tokens_output == 100
+        assert response.num_tokens_output_reasoning == 60
+
+        # Runner: TPOT recovered from the visible-token pairing
+        await _Run._compute_time_per_output_token(response)
+        # (5.0 - 2.0) / ((100 - 60) - 1)
+        assert response.time_per_output_token == pytest.approx(3.0 / 39)
+
+    @pytest.mark.asyncio
+    async def test_tpot_unavailable_without_thinking_token_count(self, mock_client):
+        """If a provider or gateway strips the breakdown, TPOT must be None rather than wrong.
+
+        Pins the boundary of the recovery above: it depends entirely on `thinking_tokens` being
+        reported, since without it the visible-token count cannot be derived.
+        """
+        from llmeter.runner import _Run
+
+        endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7")
+        response = _make_draft_response()
+
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.1, 100.5, 102.0, 105.0, 106.0]
+            endpoint.process_raw_response(
+                iter(self._omitted_mode_events(thinking_tokens=None)), 100.0, response
+            )
+
+        assert response.time_to_first_token is None
+        assert response.num_tokens_output_reasoning is None
+
+        await _Run._compute_time_per_output_token(response)
+        assert response.time_per_output_token is None

@@ -26,10 +26,12 @@ FIXTURES_DIR = Path(__file__).parent / "result_snapshots"
 
 
 def _write_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=4, default=json_default) + "\n")
 
 
 def _write_jsonl(path: Path, lines: list[str]):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -54,6 +56,51 @@ def _compute_and_write_stats(
 # =============================================================================
 # Scenario: base (modern format, OpenAI endpoint, CostModel + Mlflow callbacks)
 # =============================================================================
+
+
+#: Response fields that did **not** exist in the v0.1.x line. Kept as one list so every "v0_1_*"
+#: fixture strips exactly the same set: a v0.1 snapshot that carries a later field is not really
+#: testing v0.1 compatibility.
+_POST_V0_1_RESPONSE_FIELDS = (
+    "num_tokens_input_cached",
+    "num_tokens_output_reasoning",
+    "retries",
+    "annotations",
+    "time_to_first_content_token",
+)
+
+#: Response fields added *after* the v0.2.0 release. v0.2.0 shipped cached-input and reasoning
+#: token counts, `retries` and `annotations` -- but not `time_to_first_content_token`.
+_POST_V0_2_0_RESPONSE_FIELDS = ("time_to_first_content_token",)
+
+
+def _as_legacy_json(response, drop_fields, extra=None) -> str:
+    """Serialize a response as an older LLMeter version would have written it.
+
+    Args:
+        response: The `InvocationResponse` to serialize.
+        drop_fields: Field names to remove, i.e. those that post-date the version being emulated.
+        extra: Optional extra top-level keys to merge in (e.g. legacy flat cost annotations).
+    """
+    d = json.loads(response.to_json())
+    for name in drop_fields:
+        d.pop(name, None)
+    if extra:
+        d.update(extra)
+    return json.dumps(d)
+
+
+def _mirror_content_ttft(responses):
+    """Set ``time_to_first_content_token`` equal to ``time_to_first_token``.
+
+    All of these synthetic responses model non-reasoning models, where the first token *is* the
+    first visible content token, so the two metrics coincide. Applied via a helper (rather than
+    written into each response) to keep the distinction from the *legacy* fixtures explicit: those
+    deliberately omit the field entirely, because it did not exist when they were written.
+    """
+    for r in responses:
+        r.time_to_first_content_token = r.time_to_first_token
+    return responses
 
 
 def generate_base():
@@ -213,6 +260,7 @@ def generate_base():
     _write_json(out / "summary.json", summary)
 
     # stats.json
+    _mirror_content_ttft(responses)
     _compute_and_write_stats(responses, summary, out / "stats.json")
 
     # responses.jsonl
@@ -438,15 +486,10 @@ def generate_legacy_endpoint_type():
         },
     ]
     for resp, cost in zip(responses, costs):
-        d = json.loads(resp.to_json())
-        # Remove modern fields that didn't exist in v0.1
-        d.pop("num_tokens_input_cached", None)
-        d.pop("num_tokens_output_reasoning", None)
-        d.pop("retries", None)
-        d.pop("annotations", None)
-        # Add legacy flat cost annotations
-        d.update(cost)
-        legacy_responses.append(json.dumps(d))
+        # Legacy flat cost annotations were written as top-level keys in v0.1
+        legacy_responses.append(
+            _as_legacy_json(resp, _POST_V0_1_RESPONSE_FIELDS, extra=cost)
+        )
     _write_jsonl(out / "responses.jsonl", legacy_responses)
 
     # run_config.json — legacy format
@@ -519,8 +562,11 @@ def generate_legacy_str_callbacks():
     # stats.json
     _compute_and_write_stats(responses, summary, out / "stats.json")
 
-    # responses.jsonl
-    _write_jsonl(out / "responses.jsonl", [r.to_json() for r in responses])
+    # responses.jsonl — v0.1 field set, like every other v0_1_* fixture
+    _write_jsonl(
+        out / "responses.jsonl",
+        [_as_legacy_json(r, _POST_V0_1_RESPONSE_FIELDS) for r in responses],
+    )
 
     # run_config.json — legacy with string repr callbacks
     run_config = {
@@ -579,6 +625,7 @@ def generate_interrupted_run():
     # NO summary.json — this is the point of this scenario
 
     # responses.jsonl
+    _mirror_content_ttft(responses)
     _write_jsonl(out / "responses.jsonl", [r.to_json() for r in responses])
 
     # run_config.json — modern __llmeter_class__ format (what a *current* interrupted run leaves)
@@ -593,6 +640,13 @@ def generate_interrupted_run():
                 "region": "eu-west-1",
                 "inference_config": None,
                 "max_attempts": 3,
+                # Deliberately retained even though current LLMeter versions no longer emit it, so
+                # that this snapshot represents an endpoint config saved *before*
+                # `ttft_visible_tokens_only` was retired. Note `Result.load` does not instantiate
+                # the endpoint, so loading the *Result* neither exercises nor needs the
+                # deprecation shim; the constructor path is covered by
+                # `test_snapshot_load.py::TestInterruptedRunSnapshot::
+                # test_endpoint_config_with_legacy_ttft_flag_is_constructible`.
                 "ttft_visible_tokens_only": True,
             },
         },
@@ -649,14 +703,9 @@ def generate_legacy_interrupted_run():
     # NO summary.json — recovery path
 
     # responses.jsonl (legacy: no retries/annotations/cached/reasoning fields)
-    legacy_responses = []
-    for resp in responses:
-        d = json.loads(resp.to_json())
-        d.pop("num_tokens_input_cached", None)
-        d.pop("num_tokens_output_reasoning", None)
-        d.pop("retries", None)
-        d.pop("annotations", None)
-        legacy_responses.append(json.dumps(d))
+    legacy_responses = [
+        _as_legacy_json(resp, _POST_V0_1_RESPONSE_FIELDS) for resp in responses
+    ]
     _write_jsonl(out / "responses.jsonl", legacy_responses)
 
     # run_config.json — legacy format with top-level endpoint fields (incl. derived provider)
@@ -791,6 +840,7 @@ def generate_errors_and_annotations():
     _write_jsonl(out / "responses.jsonl", [r.to_json() for r in responses])
 
     # stats.json — computed from the responses (including errors)
+    _mirror_content_ttft(responses)
     _compute_and_write_stats(responses, summary, out / "stats.json")
 
     print(f"  errors_and_annotations/ done ({len(responses)} responses, 2 errors)")
@@ -840,6 +890,7 @@ def generate_load_test():
         "end_time": "2025-01-22T12:00:05Z",
     }
     _write_json(out_1 / "summary.json", summary_1)
+    _mirror_content_ttft(responses_1)
     _compute_and_write_stats(responses_1, summary_1, out_1 / "stats.json")
     _write_jsonl(out_1 / "responses.jsonl", [r.to_json() for r in responses_1])
 
@@ -879,12 +930,105 @@ def generate_load_test():
         "end_time": "2025-01-22T12:05:05Z",
     }
     _write_json(out_3 / "summary.json", summary_3)
+    _mirror_content_ttft(responses_3)
     _compute_and_write_stats(responses_3, summary_3, out_3 / "stats.json")
     _write_jsonl(out_3 / "responses.jsonl", [r.to_json() for r in responses_3])
 
     print(
         f"  load_test/ done (2 subdirs, {len(responses_1)}+{len(responses_3)} responses)"
     )
+
+
+def generate_legacy_v0_2_visible_only_ttft():
+    """A **v0.2.0** run whose `time_to_first_token` actually means *first visible token*.
+
+    Represents the case that motivated `LegacyResultFormatWarning`. Note this is deliberately a
+    v0.2 fixture, not a v0.1 one: `ttft_visible_tokens_only` was introduced *by* the release that
+    became v0.2.0, so no v0.1 file could ever have been written with it. Accordingly this keeps the
+    full v0.2.0 response field set and omits only `time_to_first_content_token`.
+
+    Under the old `ttft_visible_tokens_only=True` default the recorded TTFT is what LLMeter now
+    calls `time_to_first_content_token`, and `time_per_output_token` was computed by dividing the
+    post-reasoning window by a reasoning-inclusive token count.
+
+    Deliberately *not* migratable: `BedrockConverseStream` never records a reasoning-token count, so
+    `num_tokens_output_reasoning` is null and there is no way to tell from the file whether the
+    model reasoned at all, nor to reconstruct the true first-token time. That is why LLMeter warns
+    instead of rewriting.
+    """
+    out = FIXTURES_DIR / "legacy" / "v0_2_visible_only_ttft"
+
+    responses = [
+        InvocationResponse(
+            id=f"synth-vo-{i:03d}",
+            response_text=f"Synthetic visible-only-TTFT response {i}.",
+            input_prompt=f"Synthetic reasoning prompt {i}.",
+            # Under the old default this was the first *visible* token, i.e. it already includes
+            # the model's thinking time.
+            time_to_first_token=2.0 + 0.5 * i,
+            time_to_last_token=5.0 + 0.5 * i,
+            num_tokens_input=40 + 5 * i,
+            # Includes thinking tokens, but with no breakdown recorded to separate them.
+            num_tokens_output=200 + 10 * i,
+            # Old mixed-pairing TPOT: (TTLT - visible TTFT) / (all output tokens - 1)
+            time_per_output_token=(5.0 + 0.5 * i - (2.0 + 0.5 * i))
+            / (200 + 10 * i - 1),
+            error=None,
+            retries=0,
+            request_time=datetime(2025, 2, 10, 9, 0, i, tzinfo=timezone.utc),
+        )
+        for i in range(1, 5)
+    ]
+
+    # Only `time_to_first_content_token` post-dates v0.2.0; everything else it shipped with is
+    # retained (null for the counts Bedrock Converse does not report).
+    _write_jsonl(
+        out / "responses.jsonl",
+        [_as_legacy_json(r, _POST_V0_2_0_RESPONSE_FIELDS) for r in responses],
+    )
+
+    summary = {
+        "total_requests": len(responses),
+        "clients": 2,
+        "n_requests": 4,
+        "model_id": "synthetic.reasoning-model-v1",
+        "output_path": "stale/visible-only-ttft/path",
+        "endpoint_name": "synthetic-visible-only-endpoint",
+        "provider": "bedrock",
+        "run_name": "synthetic-visible-only-ttft",
+        "run_description": "Saved before time_to_first_content_token existed",
+        "total_test_time": 24.0,
+        "start_time": "2025-02-10T09:00:00Z",
+        "end_time": "2025-02-10T09:00:24Z",
+    }
+    _write_json(out / "summary.json", summary)
+    _compute_and_write_stats(responses, summary, out / "stats.json")
+
+    # run_config.json records the retired flag, showing where the old semantics came from. Note
+    # `Result.load` does not read this file when summary.json exists, which is exactly why
+    # detection cannot rely on it.
+    _write_json(
+        out / "run_config.json",
+        {
+            "endpoint": {
+                "__llmeter_class__": "llmeter.endpoints.bedrock.BedrockConverseStream",
+                "__llmeter_state__": {
+                    "model_id": "synthetic.reasoning-model-v1",
+                    "endpoint_name": "synthetic-visible-only-endpoint",
+                    "region": "us-east-1",
+                    "inference_config": None,
+                    "max_attempts": 3,
+                    "ttft_visible_tokens_only": True,
+                },
+            },
+            "output_path": "stale/visible-only-ttft/path",
+            "clients": 2,
+            "n_requests": 4,
+            "run_name": "synthetic-visible-only-ttft",
+        },
+    )
+
+    print(f"  legacy/v0_2_visible_only_ttft/ done ({len(responses)} responses)")
 
 
 # =============================================================================
@@ -896,6 +1040,7 @@ if __name__ == "__main__":
     generate_legacy_str_callbacks()
     generate_interrupted_run()
     generate_legacy_interrupted_run()
+    generate_legacy_v0_2_visible_only_ttft()
     generate_errors_and_annotations()
     generate_load_test()
     print("Done!")

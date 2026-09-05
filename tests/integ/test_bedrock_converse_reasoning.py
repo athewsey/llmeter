@@ -40,45 +40,36 @@ def reasoning_model_id():
     Defaults to openai.gpt-oss-120b-1:0 which supports extended thinking
     via the Bedrock Converse API.
     """
-    return os.environ.get(
-        "BEDROCK_REASONING_TEST_MODEL", "openai.gpt-oss-120b-1:0"
-    )
+    return os.environ.get("BEDROCK_REASONING_TEST_MODEL", "openai.gpt-oss-120b-1:0")
 
 
-@pytest.mark.integ
-def test_converse_stream_reasoning_visible_ttft(
-    aws_credentials, aws_region, reasoning_model_id
-):
-    """Test streaming with a reasoning model and ttft_visible_tokens_only=True (default).
+PROMPT = "What is 15 * 37? Reply with just the number."
 
-    Validates that:
-    - The endpoint successfully invokes a reasoning-capable model
-    - Response text is returned (reasoning content is not included)
-    - TTFT is measured on the first visible text token
-    - TTLT >= TTFT
-    - Token counts are populated
 
-    With ttft_visible_tokens_only=True, TTFT should reflect the time to the
-    first *visible* text token, excluding any reasoning/thinking time.
-    """
-    endpoint = BedrockConverseStream(
-        model_id=reasoning_model_id,
-        region=aws_region,
-    )
-
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"text": "What is 15 * 37? Reply with just the number."}
-                ],
-            }
-        ],
+def _payload() -> dict:
+    return {
+        "messages": [{"role": "user", "content": [{"text": PROMPT}]}],
         "inferenceConfig": {"maxTokens": 200},
     }
 
-    response = endpoint.invoke(payload)
+
+@pytest.mark.integ
+def test_converse_stream_reasoning_first_token_metrics(
+    aws_credentials, aws_region, reasoning_model_id
+):
+    """Both first-token metrics are recorded from a single reasoning-model invocation.
+
+    Validates that:
+    - The endpoint successfully invokes a reasoning-capable model
+    - `time_to_first_token` (any token, i.e. reasoning) is populated
+    - `time_to_first_content_token` (first visible token) is populated
+    - TTFT <= content TTFT <= TTLT, which holds within a single request by construction
+    - Response text contains only visible content
+    - Token counts are populated
+    """
+    endpoint = BedrockConverseStream(model_id=reasoning_model_id, region=aws_region)
+
+    response = endpoint.invoke(_payload())
 
     assert response.error is None, (
         f"Response should not contain errors: {response.error}"
@@ -91,16 +82,20 @@ def test_converse_stream_reasoning_visible_ttft(
         f"Expected '555' in response, got: {response.response_text}"
     )
 
-    # Verify timing
-    assert response.time_to_first_token is not None, (
-        "Time to first token should not be None"
-    )
+    # Verify timing. Both metrics come from the same stream, so the ordering is exact -
+    # no jitter tolerance is needed.
+    assert response.time_to_first_token is not None, "TTFT should not be None"
     assert response.time_to_first_token > 0, "TTFT should be positive"
-    assert response.time_to_last_token is not None, (
-        "Time to last token should not be None"
+    assert response.time_to_first_content_token is not None, (
+        "Content TTFT should not be None"
     )
-    assert response.time_to_last_token >= response.time_to_first_token, (
-        "TTLT should be >= TTFT"
+    assert response.time_to_first_token <= response.time_to_first_content_token, (
+        f"TTFT ({response.time_to_first_token:.3f}s) must not exceed content TTFT "
+        f"({response.time_to_first_content_token:.3f}s)"
+    )
+    assert response.time_to_last_token is not None, "TTLT should not be None"
+    assert response.time_to_last_token >= response.time_to_first_content_token, (
+        "TTLT should be >= content TTFT"
     )
 
     # Verify token counts
@@ -111,86 +106,30 @@ def test_converse_stream_reasoning_visible_ttft(
 
 
 @pytest.mark.integ
-def test_converse_stream_reasoning_inclusive_ttft(
+def test_converse_stream_reasoning_precedes_visible_text(
     aws_credentials, aws_region, reasoning_model_id
 ):
-    """Test streaming with a reasoning model and ttft_visible_tokens_only=False.
+    """Reasoning deltas are detected, so TTFT lands strictly before the first visible token.
 
-    Validates that:
-    - TTFT is measured on the first token of any kind (including reasoning)
-    - TTFT with reasoning included should be <= TTFT with visible-only
-    - Response text still contains only visible content
-    - TTLT >= TTFT
+    This is the assertion that would fail if `reasoningContent` deltas stopped being
+    recognized: both metrics would collapse onto the same text delta.
 
-    This test creates two endpoints — one with visible-only TTFT and one with
-    inclusive TTFT — and compares their timing to verify reasoning tokens are
-    being detected.
+    Note this requires the model to actually emit reasoning content for the prompt. It is
+    separated from the metric-plumbing test above so that a model or prompt that happens not
+    to trigger reasoning fails here only, and diagnosably.
     """
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"text": "What is 15 * 37? Reply with just the number."}
-                ],
-            }
-        ],
-        "inferenceConfig": {"maxTokens": 200},
-    }
+    endpoint = BedrockConverseStream(model_id=reasoning_model_id, region=aws_region)
 
-    # Inclusive TTFT (includes reasoning tokens)
-    endpoint_inclusive = BedrockConverseStream(
-        model_id=reasoning_model_id,
-        region=aws_region,
-        ttft_visible_tokens_only=False,
-    )
-    response_inclusive = endpoint_inclusive.invoke(payload)
+    response = endpoint.invoke(_payload())
 
-    assert response_inclusive.error is None, (
-        f"Inclusive response should not contain errors: {response_inclusive.error}"
+    assert response.error is None, (
+        f"Response should not contain errors: {response.error}"
     )
-
-    # Verify response text
-    assert response_inclusive.response_text is not None, (
-        "Response text should not be None"
-    )
-    assert "555" in response_inclusive.response_text, (
-        f"Expected '555' in response, got: {response_inclusive.response_text}"
-    )
-
-    # Verify timing
-    assert response_inclusive.time_to_first_token is not None, (
-        "Inclusive TTFT should not be None"
-    )
-    assert response_inclusive.time_to_first_token > 0, (
-        "Inclusive TTFT should be positive"
-    )
-    assert response_inclusive.time_to_last_token is not None, (
-        "TTLT should not be None"
-    )
-    assert response_inclusive.time_to_last_token >= response_inclusive.time_to_first_token, (
-        "TTLT should be >= TTFT"
-    )
-
-    # Visible-only TTFT
-    endpoint_visible = BedrockConverseStream(
-        model_id=reasoning_model_id,
-        region=aws_region,
-        ttft_visible_tokens_only=True,
-    )
-    response_visible = endpoint_visible.invoke(payload)
-
-    assert response_visible.error is None, (
-        f"Visible response should not contain errors: {response_visible.error}"
-    )
-    assert response_visible.time_to_first_token is not None, (
-        "Visible TTFT should not be None"
-    )
-
-    # The inclusive TTFT should be <= visible-only TTFT because reasoning
-    # tokens arrive before visible text tokens. We allow a small tolerance
-    # for network jitter.
-    assert response_inclusive.time_to_first_token <= response_visible.time_to_first_token + 0.5, (
-        f"Inclusive TTFT ({response_inclusive.time_to_first_token:.3f}s) should be "
-        f"<= visible TTFT ({response_visible.time_to_first_token:.3f}s) + tolerance"
+    assert response.time_to_first_token is not None
+    assert response.time_to_first_content_token is not None
+    assert response.time_to_first_token < response.time_to_first_content_token, (
+        f"Expected reasoning to precede visible text, but TTFT "
+        f"({response.time_to_first_token:.3f}s) was not less than content TTFT "
+        f"({response.time_to_first_content_token:.3f}s). Either the model emitted no "
+        f"reasoning content, or reasoning deltas are no longer being detected."
     )

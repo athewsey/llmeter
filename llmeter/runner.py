@@ -279,6 +279,7 @@ class _Run(_RunConfig):
             metrics=[
                 "time_to_last_token",
                 "time_to_first_token",
+                "time_to_first_content_token",
                 "time_per_output_token",
                 "num_tokens_output",
                 "num_tokens_input",
@@ -330,19 +331,47 @@ class _Run(_RunConfig):
         """
         Compute the time per output token for the given response.
 
+        TPOT is the mean decode interval, so the elapsed time in the numerator and the token count
+        in the denominator must cover the *same* tokens. Two pairings satisfy that, and are tried
+        in order:
+
+        1. **All tokens.** `(time_to_last_token - time_to_first_token) / (num_tokens_output - 1)`.
+           `time_to_first_token` marks the first token of any kind and `num_tokens_output` counts
+           every generated token (reasoning included), so the two agree.
+        2. **Content tokens only.** Used when `time_to_first_token` is unavailable (due to
+           encrypted or summarised reasoning for example) but the `time_to_first_content_token` was
+           available and the provider reports how many output tokens were reasoning, letting us
+           subtract them:
+           `(time_to_last_token - time_to_first_content_token) / (num_visible_tokens - 1)`.
+
+        Mixing the two - for instance dividing the post-reasoning decode window by a token count
+        that still includes reasoning tokens - understates TPOT, so when neither pairing is
+        available `time_per_output_token` is left as `None` rather than approximated.
+
         Args:
             response (InvocationResponse): The response to compute time per output token for.
         """
-        if response.time_per_output_token is None:
-            if (
-                response.time_to_last_token
-                and response.num_tokens_output
-                and response.num_tokens_output > 1
-                and response.time_to_first_token
-            ):
-                response.time_per_output_token = (
-                    response.time_to_last_token - response.time_to_first_token
-                ) / (response.num_tokens_output - 1)
+        if response.time_per_output_token is not None:
+            return  # Endpoint already calculated it
+        if not response.time_to_last_token or not response.num_tokens_output:
+            return  # Required data points not available
+
+        if response.time_to_first_token:
+            start = response.time_to_first_token
+            n_tokens = response.num_tokens_output
+        elif (
+            response.time_to_first_content_token
+            and response.num_tokens_output_reasoning is not None
+        ):
+            start = response.time_to_first_content_token
+            n_tokens = response.num_tokens_output - response.num_tokens_output_reasoning
+        else:
+            return  # No internally-consistent combination of data points available
+
+        if n_tokens > 1:
+            response.time_per_output_token = (response.time_to_last_token - start) / (
+                n_tokens - 1
+            )
 
     @staticmethod
     async def _update_token_counts(tokenizer: Tokenizer, response: InvocationResponse):

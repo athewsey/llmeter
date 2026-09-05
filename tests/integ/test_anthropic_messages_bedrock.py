@@ -221,3 +221,74 @@ def test_anthropic_messages_create_payload_roundtrip(
     assert "4" in response.response_text, (
         f"Expected '4' in response, got: {response.response_text}"
     )
+
+
+@pytest.mark.integ
+def test_anthropic_messages_thinking_token_accounting(
+    aws_credentials,
+    bedrock_anthropic_mantle_region,
+    bedrock_anthropic_mantle_test_model,
+):
+    """`usage.output_tokens_details.thinking_tokens` is read into num_tokens_output_reasoning.
+
+    This is the assertion that catches the field being renamed, dropped, or surfaced in a shape
+    our extraction doesn't handle -- note the anthropic SDK returns it as a plain dict on
+    versions that don't model it, and as an object on versions that do.
+
+    Also verifies the downstream consequence: with a thinking-token count available, TPOT is
+    derivable even in `display: "omitted"` mode where TTFT is unmeasurable.
+
+    Estimated Cost: ~$0.001 per run
+    """
+    endpoint = AnthropicMessagesStream(
+        model_id=bedrock_anthropic_mantle_test_model,
+        provider="bedrock-mantle",
+        aws_region=bedrock_anthropic_mantle_region,
+    )
+
+    payload = AnthropicMessagesEndpoint.create_payload(
+        "What is 15 * 37? Reply with just the number.",
+        max_tokens=2048,
+        thinking={"type": "adaptive", "display": "omitted"},
+    )
+
+    response = endpoint.invoke(payload)
+
+    assert response.error is None, f"Response error: {response.error}"
+
+    assert response.num_tokens_output is not None, (
+        "Output token count should not be None"
+    )
+    assert response.num_tokens_output_reasoning is not None, (
+        "Anthropic reports usage.output_tokens_details.thinking_tokens, so "
+        "num_tokens_output_reasoning should be populated. If this fails, check whether the "
+        "field has been renamed or is arriving in an unexpected shape."
+    )
+    assert response.num_tokens_output_reasoning > 0, (
+        "Expected a non-zero thinking-token count with thinking enabled, got "
+        f"{response.num_tokens_output_reasoning}"
+    )
+    assert response.num_tokens_output_reasoning <= response.num_tokens_output, (
+        f"Thinking tokens ({response.num_tokens_output_reasoning}) should be <= total output "
+        f"tokens ({response.num_tokens_output}) -- the total is inclusive"
+    )
+
+    # display="omitted" suppresses thinking deltas, so first-token time is unmeasurable...
+    assert response.time_to_first_token is None, (
+        "TTFT should be None in omitted mode, where no thinking deltas are streamed"
+    )
+    assert response.time_to_first_content_token is not None, (
+        "Content TTFT should still be measured in omitted mode"
+    )
+    # ...but the signature time is preserved for reference
+    assert "anthropic_time_to_thinking_signature" in response.annotations, (
+        "The signature arrival time should be recorded as an annotation"
+    )
+
+    # ...and the ingredients for the visible-token TPOT fallback are all present. The fallback
+    # arithmetic itself is covered by the unit tests; what only a live call can confirm is that
+    # the provider supplies the inputs it needs.
+    assert response.time_to_last_token is not None
+    assert response.num_tokens_output - response.num_tokens_output_reasoning >= 0, (
+        "Visible token count should not be negative"
+    )

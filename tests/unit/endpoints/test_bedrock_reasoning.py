@@ -4,15 +4,17 @@
 """Unit tests for reasoning token parsing in BedrockConverseStream.
 
 Covers:
-- TTFT measurement with ``ttft_visible_tokens_only=True`` (default): reasoning
-  content deltas are ignored, TTFT set on first visible text delta.
-- TTFT measurement with ``ttft_visible_tokens_only=False``: TTFT set on first
-  ``reasoningContent`` delta.
-- Reasoning deltas do not contribute to ``response_text``.
+- ``time_to_first_token`` is set by the first delta of any kind, including
+  ``reasoningContent`` deltas.
+- ``time_to_first_content_token`` is set only by the first visible ``text`` delta.
+- Reasoning deltas never contribute to ``response_text``.
+- The retired ``ttft_visible_tokens_only`` argument warns and is ignored.
 """
 
 import time
 from unittest.mock import patch
+
+import pytest
 
 from llmeter.endpoints.base import InvocationResponse
 from llmeter.endpoints.bedrock import BedrockConverseStream
@@ -30,181 +32,200 @@ def _stream_response(stream_chunks: list[dict]) -> dict:
     }
 
 
+def _reasoning_delta(text: str = "thinking...") -> dict:
+    return {"contentBlockDelta": {"delta": {"reasoningContent": {"text": text}}}}
+
+
+def _text_delta(text: str) -> dict:
+    return {"contentBlockDelta": {"delta": {"text": text}}}
+
+
+_USAGE_CHUNK = {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}}
+
+
 # ---------------------------------------------------------------------------
-# Tests: TTFT with ttft_visible_tokens_only=True (default)
+# Tests: the two first-token metrics
 # ---------------------------------------------------------------------------
 
 
-class TestTTFTVisibleTokensOnly:
-    """When ttft_visible_tokens_only=True, reasoningContent deltas must not set TTFT."""
+class TestFirstTokenMetrics:
+    """`time_to_first_token` covers any token; `time_to_first_content_token` only visible ones."""
 
-    def test_reasoning_delta_ignored_for_ttft(self):
-        """reasoningContent delta should NOT set TTFT when visible_only=True."""
+    @patch("time.perf_counter")
+    def test_reasoning_sets_ttft_and_text_sets_content_ttft(self, mock_perf_counter):
+        """The two metrics must resolve to the reasoning and text deltas respectively."""
+        # Calls: reasoning_delta, text_delta, contentBlockStop, metadata
+        mock_perf_counter.side_effect = [100.2, 100.5, 100.6, 100.7]
+
         endpoint = BedrockConverseStream(model_id="test-model")
-
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking..."}}}},
-            {"contentBlockDelta": {"delta": {"text": "Hello"}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
+        raw = _stream_response(
+            [
+                _reasoning_delta(),
+                _text_delta("Answer"),
+                {"contentBlockStop": {}},
+                _USAGE_CHUNK,
+            ]
+        )
 
         response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(raw, start_t, response)
+        endpoint.process_raw_response(raw, 100.0, response)
 
-        assert response.time_to_first_token is not None
-        assert response.response_text == "Hello"
+        assert response.time_to_first_token == pytest.approx(0.2)
+        assert response.time_to_first_content_token == pytest.approx(0.5)
+        assert response.time_to_last_token == pytest.approx(0.6)
 
-    def test_multiple_reasoning_deltas_ignored(self):
-        """Multiple reasoningContent deltas should all be ignored for TTFT."""
+    def test_multiple_reasoning_deltas_do_not_overwrite_ttft(self):
+        """Only the *first* reasoning delta sets TTFT."""
         endpoint = BedrockConverseStream(model_id="test-model")
-
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "step 1"}}}},
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "step 2"}}}},
-            {"contentBlockDelta": {"delta": {"text": "Answer"}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
+        raw = _stream_response(
+            [
+                _reasoning_delta("step 1"),
+                _reasoning_delta("step 2"),
+                _text_delta("Answer"),
+                {"contentBlockStop": {}},
+                _USAGE_CHUNK,
+            ]
+        )
 
         response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(raw, start_t, response)
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.2, 100.3, 100.5, 100.6, 100.7]
+            endpoint.process_raw_response(raw, 100.0, response)
+
+        assert response.time_to_first_token == pytest.approx(0.2)
+        assert response.time_to_first_content_token == pytest.approx(0.5)
+
+    def test_multiple_text_deltas_do_not_overwrite_content_ttft(self):
+        """Only the *first* text delta sets the content TTFT."""
+        endpoint = BedrockConverseStream(model_id="test-model")
+        raw = _stream_response(
+            [
+                _text_delta("Hello"),
+                _text_delta(" world"),
+                {"contentBlockStop": {}},
+                _USAGE_CHUNK,
+            ]
+        )
+
+        response = _make_draft_response()
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.4, 100.5, 100.6, 100.7]
+            endpoint.process_raw_response(raw, 100.0, response)
+
+        assert response.time_to_first_content_token == pytest.approx(0.4)
+        assert response.response_text == "Hello world"
+
+    def test_metrics_equal_without_reasoning(self):
+        """With no reasoning content the two metrics describe the same token."""
+        endpoint = BedrockConverseStream(model_id="test-model")
+        raw = _stream_response(
+            [_text_delta("Hello"), {"contentBlockStop": {}}, _USAGE_CHUNK]
+        )
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(raw, time.perf_counter(), response)
 
         assert response.time_to_first_token is not None
-        assert response.response_text == "Answer"
+        assert response.time_to_first_token == response.time_to_first_content_token
 
-    def test_reasoning_deltas_do_not_contribute_to_response_text(self):
-        """reasoningContent deltas must never appear in response_text."""
+    def test_empty_text_delta_does_not_set_timings(self):
+        """An empty text delta is not a token."""
         endpoint = BedrockConverseStream(model_id="test-model")
+        raw = _stream_response(
+            [_text_delta(""), _text_delta("Hi"), {"contentBlockStop": {}}, _USAGE_CHUNK]
+        )
 
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "internal thought"}}}},
-            {"contentBlockDelta": {"delta": {"text": "Visible"}}},
-            {"contentBlockDelta": {"delta": {"text": " answer"}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
+        response = _make_draft_response()
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.2, 100.5, 100.6, 100.7]
+            endpoint.process_raw_response(raw, 100.0, response)
+
+        assert response.time_to_first_token == pytest.approx(0.5)
+        assert response.time_to_first_content_token == pytest.approx(0.5)
+
+    def test_only_reasoning_no_text(self):
+        """Reasoning-only stream: TTFT is set, but there is no content token to time."""
+        endpoint = BedrockConverseStream(model_id="test-model")
+        raw = _stream_response(
+            [
+                _reasoning_delta(),
+                {"contentBlockStop": {}},
+                {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 0}}},
+            ]
+        )
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(raw, time.perf_counter(), response)
+
+        assert response.time_to_first_token is not None
+        assert response.time_to_first_content_token is None
+        assert response.response_text is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: response_text must never include reasoning
+# ---------------------------------------------------------------------------
+
+
+class TestResponseText:
+    def test_reasoning_deltas_excluded_from_response_text(self):
+        endpoint = BedrockConverseStream(model_id="test-model")
+        raw = _stream_response(
+            [
+                _reasoning_delta("internal thought"),
+                _text_delta("Visible"),
+                _text_delta(" answer"),
+                {"contentBlockStop": {}},
+                _USAGE_CHUNK,
+            ]
+        )
 
         response = _make_draft_response()
         endpoint.process_raw_response(raw, time.perf_counter(), response)
 
         assert response.response_text == "Visible answer"
-
-    @patch("time.perf_counter")
-    def test_ttft_set_on_text_not_reasoning(self, mock_perf_counter):
-        """Verify TTFT value corresponds to the text delta, not the reasoning delta."""
-        start_t = 100.0
-        # Calls: reasoning_delta, text_delta, contentBlockStop, metadata
-        mock_perf_counter.side_effect = [100.3, 100.5, 100.6, 100.7]
-
-        endpoint = BedrockConverseStream(model_id="test-model")
-
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking"}}}},
-            {"contentBlockDelta": {"delta": {"text": "Result"}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
-
-        response = _make_draft_response()
-        endpoint.process_raw_response(raw, start_t, response)
-
-        # TTFT should be ~0.5 (text delta), not ~0.3 (reasoning delta)
-        assert abs(response.time_to_first_token - 0.5) < 1e-5
+        assert "internal thought" not in (response.response_text or "")
 
 
 # ---------------------------------------------------------------------------
-# Tests: TTFT with ttft_visible_tokens_only=False
+# Tests: deprecated constructor argument
 # ---------------------------------------------------------------------------
 
 
-class TestTTFTIncludesReasoning:
-    """When ttft_visible_tokens_only=False, first reasoningContent delta sets TTFT."""
+class TestDeprecatedTtftFlag:
+    @pytest.mark.parametrize("value", [True, False])
+    def test_passing_flag_warns(self, value):
+        with pytest.warns(DeprecationWarning, match="ttft_visible_tokens_only"):
+            BedrockConverseStream(model_id="test-model", ttft_visible_tokens_only=value)
 
-    def test_reasoning_delta_sets_ttft(self):
-        """reasoningContent delta should set TTFT when visible_only=False."""
-        endpoint = BedrockConverseStream(
-            model_id="test-model", ttft_visible_tokens_only=False
-        )
+    def test_omitting_flag_does_not_warn(self, recwarn):
+        BedrockConverseStream(model_id="test-model")
+        assert [w for w in recwarn if w.category is DeprecationWarning] == []
 
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking..."}}}},
-            {"contentBlockDelta": {"delta": {"text": "Result"}}},
+    def test_flag_does_not_change_behaviour(self):
+        """Both metrics are recorded regardless of the retired flag's value."""
+        raw_chunks = [
+            _reasoning_delta(),
+            _text_delta("Answer"),
             {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
+            _USAGE_CHUNK,
+        ]
 
-        response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(raw, start_t, response)
+        results = []
+        for value in (True, False):
+            with pytest.warns(DeprecationWarning):
+                endpoint = BedrockConverseStream(
+                    model_id="test-model", ttft_visible_tokens_only=value
+                )
+            response = _make_draft_response()
+            with patch("time.perf_counter") as clock:
+                clock.side_effect = [100.2, 100.5, 100.6, 100.7]
+                endpoint.process_raw_response(
+                    _stream_response(raw_chunks), 100.0, response
+                )
+            results.append(
+                (response.time_to_first_token, response.time_to_first_content_token)
+            )
 
-        assert response.time_to_first_token is not None
-        assert response.time_to_first_token <= response.time_to_last_token
-        assert response.response_text == "Result"
-
-    def test_ttft_not_overwritten_by_later_text_delta(self):
-        """Once TTFT is set by reasoning delta, text delta must not overwrite it."""
-        endpoint = BedrockConverseStream(
-            model_id="test-model", ttft_visible_tokens_only=False
-        )
-
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "step 1"}}}},
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "step 2"}}}},
-            {"contentBlockDelta": {"delta": {"text": "Final"}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
-
-        response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(raw, start_t, response)
-
-        assert response.time_to_first_token is not None
-        assert response.time_to_first_token <= response.time_to_last_token
-
-    @patch("time.perf_counter")
-    def test_ttft_timing_set_on_reasoning_not_text(self, mock_perf_counter):
-        """Verify TTFT value corresponds to the reasoning delta, not the text delta."""
-        start_t = 100.0
-        # Calls: reasoning_delta, text_delta, contentBlockStop, metadata
-        mock_perf_counter.side_effect = [100.2, 100.5, 100.6, 100.7]
-
-        endpoint = BedrockConverseStream(
-            model_id="test-model", ttft_visible_tokens_only=False
-        )
-
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking"}}}},
-            {"contentBlockDelta": {"delta": {"text": "Answer"}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
-        ])
-
-        response = _make_draft_response()
-        endpoint.process_raw_response(raw, start_t, response)
-
-        # TTFT should be ~0.2 (reasoning delta), not ~0.5 (text delta)
-        assert abs(response.time_to_first_token - 0.2) < 1e-5
-        assert abs(response.time_to_last_token - 0.6) < 1e-5
-
-    def test_only_reasoning_no_text(self):
-        """Stream with only reasoning deltas and no text — TTFT set, no response_text."""
-        endpoint = BedrockConverseStream(
-            model_id="test-model", ttft_visible_tokens_only=False
-        )
-
-        raw = _stream_response([
-            {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking"}}}},
-            {"contentBlockStop": {}},
-            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 0}}},
-        ])
-
-        response = _make_draft_response()
-        start_t = time.perf_counter()
-        endpoint.process_raw_response(raw, start_t, response)
-
-        assert response.time_to_first_token is not None
-        assert response.response_text is None
+        assert results[0] == results[1]
+        assert results[0] == (pytest.approx(0.2), pytest.approx(0.5))

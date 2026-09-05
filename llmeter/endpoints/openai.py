@@ -34,7 +34,7 @@ from ..prompt_utils import (
     MediaContent,
     VideoContent,
 )
-from .base import Endpoint, InvocationResponse
+from .base import Endpoint, InvocationResponse, delta_has_reasoning_content
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +375,13 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint[Iterable[ChatCompletionChunk
         start_t: float,
         response: InvocationResponse,
     ) -> None:
-        """Parse the streaming API response from OpenAI chat completion API."""
+        """Parse the streaming API response from OpenAI chat completion API.
+
+        For reasoning models, chunks carrying reasoning content (see
+        [`delta_has_reasoning_content`][llmeter.endpoints.base.delta_has_reasoning_content]) set
+        `time_to_first_token` but never contribute to `response_text`. The first chunk with visible
+        `delta.content` sets `time_to_first_content_token`.
+        """
         got_chunk_id = False
         for chunk in raw_response:
             now = time.perf_counter()
@@ -385,14 +391,23 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint[Iterable[ChatCompletionChunk
                 got_chunk_id = True
 
             if chunk.choices:
-                content = chunk.choices[0].delta.content
+                delta = chunk.choices[0].delta
+                content = delta.content
                 if content:
-                    if response.response_text is None:
+                    if response.time_to_first_token is None:
                         response.time_to_first_token = now - start_t
+                    if response.time_to_first_content_token is None:
+                        response.time_to_first_content_token = now - start_t
+                    if response.response_text is None:
                         response.response_text = content
                     else:
                         response.response_text += content
                     response.time_to_last_token = now - start_t
+                elif (
+                    response.time_to_first_token is None
+                    and delta_has_reasoning_content(delta)
+                ):
+                    response.time_to_first_token = now - start_t
 
             if chunk.usage is not None:
                 response.num_tokens_input = chunk.usage.prompt_tokens

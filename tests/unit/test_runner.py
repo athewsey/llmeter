@@ -1210,3 +1210,136 @@ def test_prepare_run_duration_and_n_requests_conflict(runner: Runner):
             run_duration=30,
             clients=2,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: time-per-output-token derivation
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTimePerOutputToken:
+    """TPOT must pair an elapsed time with a token count covering the *same* tokens."""
+
+    @pytest.mark.asyncio
+    async def test_all_token_pairing(self):
+        """With TTFT available, decode time and total token count are used."""
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=1.0,
+            time_to_first_content_token=3.0,
+            time_to_last_token=5.0,
+            num_tokens_output=11,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        # (5.0 - 1.0) / (11 - 1)
+        assert response.time_per_output_token == pytest.approx(0.4)
+
+    @pytest.mark.asyncio
+    async def test_all_token_pairing_ignores_reasoning_split(self):
+        """The all-token pairing is valid whether or not a reasoning count is reported."""
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=1.0,
+            time_to_first_content_token=3.0,
+            time_to_last_token=5.0,
+            num_tokens_output=11,
+            num_tokens_output_reasoning=6,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+        # *NOT* 0.5 which would indicate just the content tokens being used:
+        assert response.time_per_output_token == pytest.approx(0.4)
+
+    @pytest.mark.asyncio
+    async def test_visible_token_fallback(self):
+        """Without TTFT, a reported reasoning count enables the visible-only pairing."""
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=None,
+            time_to_first_content_token=3.0,
+            time_to_last_token=5.0,
+            num_tokens_output=11,
+            num_tokens_output_reasoning=6,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        # (5.0 - 3.0) / ((11 - 6) - 1)
+        assert response.time_per_output_token == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_no_consistent_pairing_yields_none(self):
+        """The Anthropic `display: "omitted"` case: no TTFT and no reasoning breakdown."""
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=None,
+            time_to_first_content_token=3.0,
+            time_to_last_token=5.0,
+            num_tokens_output=11,
+            num_tokens_output_reasoning=None,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        # Mixing the post-reasoning window with a reasoning-inclusive token count would
+        # understate TPOT (here 0.2 vs a true visible-only value), so report nothing.
+        assert response.time_per_output_token is None
+
+    @pytest.mark.asyncio
+    async def test_single_visible_token_yields_none(self):
+        """One visible token gives no decode interval to average over."""
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=None,
+            time_to_first_content_token=3.0,
+            time_to_last_token=5.0,
+            num_tokens_output=11,
+            num_tokens_output_reasoning=10,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        assert response.time_per_output_token is None
+
+    @pytest.mark.asyncio
+    async def test_single_output_token_yields_none(self):
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=1.0,
+            time_to_last_token=5.0,
+            num_tokens_output=1,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        assert response.time_per_output_token is None
+
+    @pytest.mark.asyncio
+    async def test_existing_value_preserved(self):
+        """An endpoint that reports TPOT directly must not be overwritten."""
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=1.0,
+            time_to_last_token=5.0,
+            num_tokens_output=11,
+            time_per_output_token=0.123,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        assert response.time_per_output_token == 0.123
+
+    @pytest.mark.asyncio
+    async def test_missing_timings_yield_none(self):
+        response = InvocationResponse(
+            response_text="x",
+            time_to_first_token=1.0,
+            time_to_last_token=None,
+            num_tokens_output=11,
+        )
+
+        await _Run._compute_time_per_output_token(response)
+
+        assert response.time_per_output_token is None

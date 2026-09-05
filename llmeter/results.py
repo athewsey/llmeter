@@ -3,6 +3,7 @@
 
 import json
 import logging
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -15,6 +16,7 @@ from upath.types import ReadablePathLike, WritablePathLike
 from .endpoints import InvocationResponse
 from .serialization import json_default, restore_dataclass_types
 from .utils import ensure_path, summary_stats_from_list
+from .warnings import LegacyResultFormatWarning
 
 logger = logging.getLogger(__name__)
 
@@ -356,9 +358,56 @@ class Result:
             )
             return []
         with responses_path.open("r") as f:
-            responses = [InvocationResponse.from_json(line) for line in f if line]
+            raw_records = [json.loads(line) for line in f if line.strip()]
+        cls._warn_if_legacy_ttft_semantics(raw_records, responses_path)
+        responses = [
+            InvocationResponse.from_json(json.dumps(record)) for record in raw_records
+        ]
         logger.info("Loaded %d responses from %s", len(responses), responses_path)
         return responses
+
+    @staticmethod
+    def _warn_if_legacy_ttft_semantics(raw_records: list[dict], responses_path) -> None:
+        """Warn when a file predates the current `time_to_first_token` definition.
+
+        Before LLMeter 0.2.1, `time_to_first_token` on the reasoning-capable streaming endpoints
+        defaulted to measuring the first *visible* token (the old `ttft_visible_tokens_only=True`),
+        which is what `time_to_first_content_token` means today. Such files therefore report a TTFT
+        that is not comparable with current runs, and a `time_per_output_token` that is understated
+        for reasoning models (it divided the post-reasoning window by a reasoning-inclusive token
+        count).
+
+        Detection relies on the **absence of the `time_to_first_content_token` key**, which is why
+        this inspects raw records: after `InvocationResponse.from_json`, an absent key and an
+        explicit `null` are indistinguishable. A non-null `time_to_first_token` is also required, so
+        that non-streaming runs (where both metrics are legitimately unset) are not flagged.
+
+        LLMeter deliberately does not rewrite the values. The old default was applied whether or not
+        a model actually reasoned, and for Bedrock Converse and Anthropic endpoints no reasoning
+        token count was recorded, so there is generally no way to tell whether a given file needs
+        correcting - let alone to reconstruct the true first-token time.
+
+        Args:
+            raw_records: Response records as parsed from JSON, before dataclass conversion.
+            responses_path: Path used to identify the file in the warning message.
+        """
+        if not any(
+            record.get("time_to_first_token") is not None
+            and "time_to_first_content_token" not in record
+            for record in raw_records
+        ):
+            return
+
+        warnings.warn(
+            f"'{responses_path}' was saved by an LLMeter version that predates "
+            "`time_to_first_content_token`. In these files `time_to_first_token` measures the "
+            "first *visible* token (what is now called `time_to_first_content_token`), so it is "
+            "not comparable with TTFT from current runs, and `time_per_output_token` may be "
+            "understated if the model used reasoning tokens. Values have been loaded unchanged; "
+            "see the 'Reasoning models' section of the LLMeter metrics guide.",
+            LegacyResultFormatWarning,
+            stacklevel=4,
+        )
 
     @classmethod
     def _resolve_stats(cls, result: "Result", stats_path) -> None:
@@ -425,6 +474,7 @@ class Result:
         aggregation_metrics = [
             "time_to_last_token",
             "time_to_first_token",
+            "time_to_first_content_token",
             "num_tokens_output",
             "num_tokens_input",
             "num_tokens_input_cached",
@@ -444,9 +494,9 @@ class Result:
 
         * Basic run information (from ``to_dict()``).
         * Aggregated statistics (``average``, ``p50``, ``p90``, ``p99``) for
-          ``time_to_last_token``, ``time_to_first_token``, ``num_tokens_output``,
-          and ``num_tokens_input``.  Keys use the format
-          ``"{metric}-{aggregation}"``.
+          ``time_to_last_token``, ``time_to_first_token``,
+          ``time_to_first_content_token``, ``num_tokens_output``, and
+          ``num_tokens_input``.  Keys use the format ``"{metric}-{aggregation}"``.
         * Run-level throughput metrics (``requests_per_minute``,
           ``total_input_tokens``, etc.).
         * Any additional stats contributed by callbacks via

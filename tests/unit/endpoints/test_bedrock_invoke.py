@@ -5,7 +5,7 @@ from io import BytesIO
 
 import pytest
 from botocore.exceptions import ClientError
-from mock import MagicMock, Mock
+from mock import MagicMock, Mock, patch
 
 from llmeter.endpoints.bedrock_invoke import (
     BedrockInvoke,
@@ -756,3 +756,98 @@ class TestBedrockInvokeSerialization:
             assert loaded.input_text_jmespath == "inputText"
             assert loaded.region == "eu-west-1"
             assert loaded._max_attempts == 8
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning models via InvokeModelWithResponseStream
+# ---------------------------------------------------------------------------
+
+
+def _invoke_chunk(**delta) -> dict:
+    """Wrap an OpenAI-style ChatCompletions delta in a Bedrock invoke-stream event."""
+    return {
+        "chunk": {
+            "bytes": json.dumps(
+                {"id": "test_id", "choices": [{"delta": delta, "index": 0}]}
+            ).encode("utf-8")
+        }
+    }
+
+
+def _invoke_stream(events: list[dict]) -> dict:
+    return {"body": events, "ResponseMetadata": {"RetryAttempts": 0}}
+
+
+class TestBedrockInvokeStreamReasoning:
+    @patch("time.perf_counter")
+    def test_reasoning_chunk_sets_ttft_only(self, mock_perf_counter):
+        """A `reasoning_content`-only chunk sets TTFT but not the content TTFT."""
+        mock_perf_counter.side_effect = [100.2, 100.6]
+
+        endpoint = BedrockInvokeStream(model_id="test_model")
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream(
+                [
+                    _invoke_chunk(reasoning_content="thinking..."),
+                    _invoke_chunk(content="Answer"),
+                ]
+            ),
+            100.0,
+            result,
+        )
+
+        assert result.time_to_first_token == pytest.approx(0.2)
+        assert result.time_to_first_content_token == pytest.approx(0.6)
+        assert result.response_text == "Answer"
+
+    def test_reasoning_excluded_from_response_text(self):
+        endpoint = BedrockInvokeStream(model_id="test_model")
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream(
+                [
+                    _invoke_chunk(reasoning_content="internal"),
+                    _invoke_chunk(content="Visible"),
+                ]
+            ),
+            time.perf_counter(),
+            result,
+        )
+
+        assert result.response_text == "Visible"
+
+    def test_metrics_equal_without_reasoning(self):
+        endpoint = BedrockInvokeStream(model_id="test_model")
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream([_invoke_chunk(content="Hello")]),
+            time.perf_counter(),
+            result,
+        )
+
+        assert result.time_to_first_token is not None
+        assert result.time_to_first_token == result.time_to_first_content_token
+
+    @patch("time.perf_counter")
+    def test_reasoning_jmespath_can_be_disabled(self, mock_perf_counter):
+        """With reasoning_text_jmespath=None, reasoning chunks are ignored entirely."""
+        mock_perf_counter.side_effect = [100.2, 100.6]
+
+        endpoint = BedrockInvokeStream(
+            model_id="test_model", reasoning_text_jmespath=None
+        )
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream(
+                [
+                    _invoke_chunk(reasoning_content="thinking..."),
+                    _invoke_chunk(content="Answer"),
+                ]
+            ),
+            100.0,
+            result,
+        )
+
+        assert result.time_to_first_token == pytest.approx(0.6)
+        assert result.time_to_first_content_token == pytest.approx(0.6)

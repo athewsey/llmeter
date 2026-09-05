@@ -12,7 +12,7 @@ from litellm import CustomStreamWrapper, completion
 from litellm.types.utils import ModelResponse
 from litellm.utils import get_llm_provider  # type: ignore
 
-from . import Endpoint, InvocationResponse
+from .base import Endpoint, InvocationResponse, delta_has_reasoning_content
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +142,13 @@ class LiteLLMStreaming(LiteLLMBase[CustomStreamWrapper]):
         start_t: float,
         response: InvocationResponse,
     ) -> None:
+        """Parse a streaming LiteLLM response.
+
+        LiteLLM normalizes provider reasoning/thinking output onto `delta.reasoning_content` and
+        `delta.thinking_blocks`. Those chunks set `time_to_first_token` but never contribute to
+        `response_text`; the first chunk with visible `delta.content` sets
+        `time_to_first_content_token`.
+        """
         usage = None
         got_chunk_id = False
 
@@ -152,14 +159,26 @@ class LiteLLMStreaming(LiteLLMBase[CustomStreamWrapper]):
                 response.id = chunk.id
                 got_chunk_id = True
 
-            content = chunk.choices[0].delta.content or ""
-            if content:
-                if response.response_text is None:
-                    response.response_text = content
+            # The final usage-only chunk can carry an empty `choices` list:
+            choices = getattr(chunk, "choices", None)
+            if choices:
+                delta = choices[0].delta
+                content = getattr(delta, "content", None) or ""
+                if content:
+                    if response.time_to_first_token is None:
+                        response.time_to_first_token = now - start_t
+                    if response.time_to_first_content_token is None:
+                        response.time_to_first_content_token = now - start_t
+                    if response.response_text is None:
+                        response.response_text = content
+                    else:
+                        response.response_text += content
+                    response.time_to_last_token = now - start_t
+                elif (
+                    response.time_to_first_token is None
+                    and delta_has_reasoning_content(delta)
+                ):
                     response.time_to_first_token = now - start_t
-                else:
-                    response.response_text += content
-                response.time_to_last_token = now - start_t
 
             try:
                 usage = chunk.usage  # type: ignore

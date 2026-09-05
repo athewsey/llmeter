@@ -4,6 +4,7 @@
 from pathlib import Path
 import tempfile
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -1015,3 +1016,105 @@ class TestStreamMidStreamErrors:
         assert response.error is not None
         assert "connection" in response.error.lower()
         assert response.input_payload is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning models on the Chat Completions streaming API
+# ---------------------------------------------------------------------------
+
+
+def _reasoning_chunk(chunk_id="chatcmpl-r1", field="reasoning_content"):
+    """Build a streaming chunk whose delta carries reasoning but no visible content.
+
+    Uses SimpleNamespace rather than MagicMock so that only the attributes set here exist -- a
+    MagicMock would auto-create `reasoning_content` on every delta.
+    """
+    delta = SimpleNamespace(content=None, **{field: "thinking..."})
+    chunk = SimpleNamespace(
+        id=chunk_id, choices=[SimpleNamespace(delta=delta)], usage=None
+    )
+    return chunk
+
+
+def _content_chunk(text, chunk_id="chatcmpl-r1"):
+    delta = SimpleNamespace(content=text)
+    return SimpleNamespace(
+        id=chunk_id, choices=[SimpleNamespace(delta=delta)], usage=None
+    )
+
+
+class TestOpenAICompletionStreamReasoning:
+    @pytest.fixture
+    def endpoint(self):
+        return OpenAICompletionStreamEndpoint(model_id="gpt-oss-120b", api_key="test")
+
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    @patch("time.perf_counter")
+    def test_reasoning_chunk_sets_ttft_only(self, mock_perf_counter, endpoint, field):
+        """A reasoning-only chunk sets TTFT but not the content TTFT."""
+        mock_perf_counter.side_effect = [100.2, 100.6]
+
+        response = InvocationResponse(response_text=None)
+        endpoint.process_raw_response(
+            iter([_reasoning_chunk(field=field), _content_chunk("Answer")]),
+            100.0,
+            response,
+        )
+
+        assert response.time_to_first_token == pytest.approx(0.2)
+        assert response.time_to_first_content_token == pytest.approx(0.6)
+        assert response.response_text == "Answer"
+
+    def test_reasoning_excluded_from_response_text(self, endpoint):
+        response = InvocationResponse(response_text=None)
+        endpoint.process_raw_response(
+            iter([_reasoning_chunk(), _content_chunk("Visible")]),
+            time.perf_counter(),
+            response,
+        )
+
+        assert response.response_text == "Visible"
+
+    def test_thinking_blocks_recognized(self, endpoint):
+        """LiteLLM-style structured thinking blocks also count as reasoning."""
+        delta = SimpleNamespace(
+            content=None, thinking_blocks=[{"type": "thinking", "thinking": "hmm"}]
+        )
+        chunk = SimpleNamespace(
+            id="c1", choices=[SimpleNamespace(delta=delta)], usage=None
+        )
+
+        response = InvocationResponse(response_text=None)
+        endpoint.process_raw_response(
+            iter([chunk, _content_chunk("Answer")]), time.perf_counter(), response
+        )
+
+        assert response.time_to_first_token is not None
+        assert response.time_to_first_token < response.time_to_first_content_token
+
+    def test_metrics_equal_without_reasoning(self, endpoint):
+        response = InvocationResponse(response_text=None)
+        endpoint.process_raw_response(
+            iter([_content_chunk("Hello")]), time.perf_counter(), response
+        )
+
+        assert response.time_to_first_token is not None
+        assert response.time_to_first_token == response.time_to_first_content_token
+
+    def test_empty_delta_without_reasoning_is_ignored(self, endpoint):
+        """A chunk with neither content nor reasoning must not set any timing."""
+        empty = SimpleNamespace(
+            id="c1",
+            choices=[SimpleNamespace(delta=SimpleNamespace(content=None))],
+            usage=None,
+        )
+
+        response = InvocationResponse(response_text=None)
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.2, 100.6]
+            endpoint.process_raw_response(
+                iter([empty, _content_chunk("Answer")]), 100.0, response
+            )
+
+        assert response.time_to_first_token == pytest.approx(0.6)
+        assert response.time_to_first_content_token == pytest.approx(0.6)

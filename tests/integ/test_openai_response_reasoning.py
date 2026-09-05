@@ -10,8 +10,8 @@ correctly handle reasoning tokens when using a reasoning-capable model
 
 Tests cover:
 - Non-streaming: num_tokens_output_reasoning extraction
-- Streaming with ttft_visible_tokens_only=True: TTFT on first visible text token
-- Streaming with ttft_visible_tokens_only=False: TTFT on first reasoning token
+- Streaming: `time_to_first_token` on the first reasoning delta, and
+  `time_to_first_content_token` on the first visible text delta
 - Comparison of inclusive vs visible-only TTFT
 
 Tests are marked with @pytest.mark.integ and are skipped by default to avoid
@@ -147,20 +147,21 @@ def test_response_non_streaming_reasoning_tokens(
 
 
 # ---------------------------------------------------------------------------
-# Streaming — visible-only TTFT (default)
+# Streaming — first-token metrics
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integ
 @pytest.mark.skipif(not OPENAI_AVAILABLE, reason="OpenAI SDK not installed")
-def test_response_streaming_reasoning_visible_ttft(
+def test_response_streaming_reasoning_first_token_metrics(
     aws_credentials, aws_region, reasoning_model_id
 ):
-    """Test streaming Response API with ttft_visible_tokens_only=True (default).
+    """Both first-token metrics are recorded from a single reasoning-model invocation.
 
     Validates that:
-    - TTFT is measured on the first visible text token
-    - Reasoning tokens do not set TTFT
+    - `time_to_first_token` (any delta, i.e. reasoning) is populated
+    - `time_to_first_content_token` (first visible text delta) is populated
+    - TTFT <= content TTFT <= TTLT, exact within a single request
     - Response text contains only visible content
     - num_tokens_output_reasoning is extracted from the completed event
     """
@@ -189,12 +190,20 @@ def test_response_streaming_reasoning_visible_ttft(
         f"Expected '555' in response, got: {response.response_text}"
     )
 
-    # Verify TTFT and TTLT
+    # Verify timing. Both metrics come from the same stream, so the ordering is exact -
+    # no jitter tolerance is needed.
     assert response.time_to_first_token is not None, "TTFT should not be None"
     assert response.time_to_first_token > 0, "TTFT should be positive"
+    assert response.time_to_first_content_token is not None, (
+        "Content TTFT should not be None"
+    )
+    assert response.time_to_first_token <= response.time_to_first_content_token, (
+        f"TTFT ({response.time_to_first_token:.3f}s) must not exceed content TTFT "
+        f"({response.time_to_first_content_token:.3f}s)"
+    )
     assert response.time_to_last_token is not None, "TTLT should not be None"
-    assert response.time_to_last_token >= response.time_to_first_token, (
-        "TTLT should be >= TTFT"
+    assert response.time_to_last_token >= response.time_to_first_content_token, (
+        "TTLT should be >= content TTFT"
     )
 
     # Verify reasoning token count if available
@@ -206,70 +215,40 @@ def test_response_streaming_reasoning_visible_ttft(
     assert response.id is not None, "Response should have an ID"
 
 
-# ---------------------------------------------------------------------------
-# Streaming — inclusive TTFT (includes reasoning)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.integ
 @pytest.mark.skipif(not OPENAI_AVAILABLE, reason="OpenAI SDK not installed")
-def test_response_streaming_reasoning_inclusive_ttft(
+def test_response_streaming_reasoning_precedes_visible_text(
     aws_credentials, aws_region, reasoning_model_id
 ):
-    """Test streaming Response API with ttft_visible_tokens_only=False.
+    """Reasoning deltas are detected, so TTFT lands strictly before the first visible token.
 
-    Validates that:
-    - TTFT is measured on the first token of any kind (including reasoning)
-    - Inclusive TTFT should be <= visible-only TTFT
-    - Response text still contains only visible content
+    This is the assertion that would fail if the reasoning delta event types stopped being
+    recognized: both metrics would collapse onto the same text delta.
+
+    Note this requires the model to actually stream reasoning deltas for the prompt. It is
+    separated from the metric-plumbing test above so that a model or prompt that happens not
+    to trigger reasoning fails here only, and diagnosably.
     """
     token = provide_token(region=aws_region)
+
+    endpoint = OpenAIResponseStreamEndpoint(
+        model_id=reasoning_model_id,
+        api_key=token,
+        base_url=_mantle_base_url(aws_region),
+    )
     payload = OpenAIResponseEndpoint.create_payload(
         user_message="What is 15 * 37? Reply with just the number.",
         max_output_tokens=200,
     )
 
-    # Inclusive TTFT (includes reasoning tokens)
-    endpoint_inclusive = OpenAIResponseStreamEndpoint(
-        model_id=reasoning_model_id,
-        api_key=token,
-        base_url=_mantle_base_url(aws_region),
-        ttft_visible_tokens_only=False,
-    )
-    response_inclusive = endpoint_inclusive.invoke(payload)
+    response = endpoint.invoke(payload)
 
-    assert response_inclusive.error is None, (
-        f"Inclusive response error: {response_inclusive.error}"
-    )
-    assert response_inclusive.response_text is not None
-    assert "555" in response_inclusive.response_text, (
-        f"Expected '555', got: {response_inclusive.response_text}"
-    )
-    assert response_inclusive.time_to_first_token is not None, (
-        "Inclusive TTFT should not be None"
-    )
-    assert response_inclusive.time_to_first_token > 0
-    assert response_inclusive.time_to_last_token >= response_inclusive.time_to_first_token
-
-    # Visible-only TTFT
-    endpoint_visible = OpenAIResponseStreamEndpoint(
-        model_id=reasoning_model_id,
-        api_key=token,
-        base_url=_mantle_base_url(aws_region),
-        ttft_visible_tokens_only=True,
-    )
-    response_visible = endpoint_visible.invoke(payload)
-
-    assert response_visible.error is None, (
-        f"Visible response error: {response_visible.error}"
-    )
-    assert response_visible.time_to_first_token is not None, (
-        "Visible TTFT should not be None"
-    )
-
-    # Inclusive TTFT should be <= visible-only TTFT (reasoning arrives first).
-    # Allow tolerance for network jitter between two separate API calls.
-    assert response_inclusive.time_to_first_token <= response_visible.time_to_first_token + 0.5, (
-        f"Inclusive TTFT ({response_inclusive.time_to_first_token:.3f}s) should be "
-        f"<= visible TTFT ({response_visible.time_to_first_token:.3f}s) + tolerance"
+    assert response.error is None, f"Response error: {response.error}"
+    assert response.time_to_first_token is not None
+    assert response.time_to_first_content_token is not None
+    assert response.time_to_first_token < response.time_to_first_content_token, (
+        f"Expected reasoning to precede visible text, but TTFT "
+        f"({response.time_to_first_token:.3f}s) was not less than content TTFT "
+        f"({response.time_to_first_content_token:.3f}s). Either the model streamed no "
+        f"reasoning deltas, or they are no longer being detected."
     )

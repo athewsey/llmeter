@@ -1,7 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from llmeter.endpoints.base import InvocationResponse
 from llmeter.endpoints.litellm import LiteLLM, LiteLLMBase, LiteLLMStreaming
@@ -488,3 +492,114 @@ class TestLiteLLMStreaming:
 
         # With 1 token, (num_tokens_output - 1) = 0, so time_per_output_token should be None
         assert result.time_per_output_token is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning models via LiteLLM
+# ---------------------------------------------------------------------------
+
+
+def _ns_chunk(chunk_id="c1", content=None, usage=None, **delta_attrs):
+    """Build a LiteLLM-shaped streaming chunk.
+
+    Uses SimpleNamespace rather than MagicMock so only the attributes set here exist -- a
+    MagicMock would auto-create `reasoning_content` on every delta.
+    """
+    delta = SimpleNamespace(content=content, **delta_attrs)
+    return SimpleNamespace(
+        id=chunk_id, choices=[SimpleNamespace(delta=delta)], usage=usage
+    )
+
+
+def _stream(chunks):
+    stream = MagicMock()
+    stream.__iter__ = lambda self: iter(chunks)
+    return stream
+
+
+class TestLiteLLMStreamingReasoning:
+    def setup_method(self):
+        with patch("llmeter.endpoints.litellm.get_llm_provider") as mock_get_provider:
+            mock_get_provider.return_value = ("gpt-3.5-turbo", "openai", None, None)
+            self.endpoint = LiteLLMStreaming(litellm_model="gpt-3.5-turbo")
+
+    @patch("time.perf_counter")
+    def test_reasoning_content_sets_ttft_only(self, mock_time):
+        """LiteLLM's normalized `reasoning_content` sets TTFT but not the content TTFT."""
+        mock_time.side_effect = [100.2, 100.6]
+
+        response = InvocationResponse(response_text=None)
+        self.endpoint.process_raw_response(
+            _stream(
+                [
+                    _ns_chunk(reasoning_content="thinking..."),
+                    _ns_chunk(content="Answer"),
+                ]
+            ),
+            100.0,
+            response,
+        )
+
+        assert response.time_to_first_token == pytest.approx(0.2)
+        assert response.time_to_first_content_token == pytest.approx(0.6)
+        assert response.response_text == "Answer"
+
+    @patch("time.perf_counter")
+    def test_thinking_blocks_set_ttft(self, mock_time):
+        mock_time.side_effect = [100.3, 100.9]
+
+        response = InvocationResponse(response_text=None)
+        self.endpoint.process_raw_response(
+            _stream(
+                [
+                    _ns_chunk(
+                        thinking_blocks=[{"type": "thinking", "thinking": "hmm"}]
+                    ),
+                    _ns_chunk(content="Answer"),
+                ]
+            ),
+            100.0,
+            response,
+        )
+
+        assert response.time_to_first_token == pytest.approx(0.3)
+        assert response.time_to_first_content_token == pytest.approx(0.9)
+
+    def test_reasoning_excluded_from_response_text(self):
+        response = InvocationResponse(response_text=None)
+        self.endpoint.process_raw_response(
+            _stream(
+                [
+                    _ns_chunk(reasoning_content="internal"),
+                    _ns_chunk(content="Visible"),
+                ]
+            ),
+            time.perf_counter(),
+            response,
+        )
+
+        assert response.response_text == "Visible"
+
+    def test_metrics_equal_without_reasoning(self):
+        response = InvocationResponse(response_text=None)
+        self.endpoint.process_raw_response(
+            _stream([_ns_chunk(content="Hello")]), time.perf_counter(), response
+        )
+
+        assert response.time_to_first_token is not None
+        assert response.time_to_first_token == response.time_to_first_content_token
+
+    def test_usage_only_chunk_with_empty_choices(self):
+        """A final usage-only chunk with no choices must not raise IndexError."""
+        usage = SimpleNamespace(prompt_tokens=7, completion_tokens=3)
+        final = SimpleNamespace(id="c1", choices=[], usage=usage)
+
+        response = InvocationResponse(response_text=None)
+        self.endpoint.process_raw_response(
+            _stream([_ns_chunk(content="Hi"), final]), time.perf_counter(), response
+        )
+
+        assert response.error is None
+        assert response.response_text == "Hi"
+        assert response.num_tokens_input == 7
+        assert response.num_tokens_output == 3

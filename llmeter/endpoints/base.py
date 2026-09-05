@@ -14,7 +14,7 @@ import logging
 import time
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Generic, TypeVar
@@ -45,17 +45,31 @@ class InvocationResponse:
         response_text (str): The invocation output.
         id (str): A unique identifier for the invocation.
         time_to_last_token (float): The time taken to generate the response in seconds.
-        time_to_first_token (float): The time taken to receive the first token of the response in seconds.
+        time_to_first_token: Seconds until the first output token of **any** kind arrived,
+            including internal reasoning/thinking tokens. This measures when the model started
+            generating, so it isolates prefill and prompt ingestion network latency from
+            generation/decode. `None` for non-streaming endpoints, **and** for streaming endpoints
+            where the first token is not directly observable (for example newer Anthropic models
+            with summarized thinking - as discussed in
+            [`AnthropicMessagesStream`][llmeter.endpoints.anthropic_messages.AnthropicMessagesStream]).
+        time_to_first_content_token: Seconds until the first **visible** (non-reasoning) output
+            token arrived. In applications where users see streaming output but internal "thinking"
+            is hidden, this will correspond closely to user-perceived latency. Equal to
+            `time_to_first_token` when the model emits no reasoning tokens. `None` for
+            non-streaming endpoints.
         num_tokens_output (Optional[int]): The number of tokens in the response.
         num_tokens_input (Optional[int]): The number of tokens in the invocation payload.
         num_tokens_input_cached: The number of input tokens served from cache (prompt caching).
         num_tokens_output_reasoning: The number of output tokens used for internal reasoning
             (included in `num_tokens_output`). Populated when the provider reports a separate
-            reasoning/thinking token count (e.g. OpenAI `reasoning_tokens`). `None` when the
-            provider does not break out reasoning tokens — for example, Anthropic includes
-            thinking tokens in `output_tokens` without a separate count.
+            reasoning/thinking token count — for example OpenAI `reasoning_tokens`, or Anthropic
+            `output_tokens_details.thinking_tokens`. `None` when the provider does not provide a
+            separate count for this.
         input_prompt (str): The input prompt used in the invocation.
-        time_per_output_token (float): The average time taken to generate each token in the response.
+        time_per_output_token (float): The average time taken to generate each token in the
+            response, **excluding** initial prompt processing/prefill. Computed by the `Runner`
+            from whichever pairing of first-token metric and token count is internally consistent;
+            `None` when no consistent pairing is available.
         error (str): Any error that occurred during invocation.
         request_time: The wall-clock time when the request was sent.
         annotations (dict): Free-form extra data attached to this response, for example by
@@ -71,6 +85,7 @@ class InvocationResponse:
     id: str | None = None
     input_prompt: str | dict | None = None
     time_to_first_token: float | None = None
+    time_to_first_content_token: float | None = None
     time_to_last_token: float | None = None
     num_tokens_input: int | None = None
     num_tokens_output: int | None = None
@@ -190,6 +205,91 @@ class InvocationResponse:
             dict: A dictionary of response fields with native Python types.
         """
         return asdict(self)
+
+
+_TTFT_VISIBLE_TOKENS_ONLY_DEPRECATION = (
+    "`ttft_visible_tokens_only` is deprecated and no longer has any effect. LLMeter now always "
+    "records both `InvocationResponse.time_to_first_token` (the first output token of any kind, "
+    "including reasoning) and `InvocationResponse.time_to_first_content_token` (the first visible "
+    "output token). Read `time_to_first_content_token` for the behaviour previously selected by "
+    "`ttft_visible_tokens_only=True`. This parameter will be removed in a future release."
+)
+
+
+def warn_if_ttft_visible_tokens_only_set(value: bool | None) -> None:
+    """Warn if a caller passed the retired `ttft_visible_tokens_only` endpoint argument.
+
+    Streaming endpoints that support reasoning models now unconditionally record both
+    [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] and
+    [`time_to_first_content_token`][llmeter.endpoints.base.InvocationResponse], so the flag that
+    used to choose between the two is redundant. It is still accepted (and ignored) so that
+    endpoint configurations saved by earlier LLMeter versions keep loading.
+
+    Args:
+        value: The value the caller passed, or `None` if the argument was omitted. Only a
+            non-`None` value triggers the warning.
+    """
+    if value is None:
+        return
+    warnings.warn(
+        _TTFT_VISIBLE_TOKENS_ONLY_DEPRECATION, DeprecationWarning, stacklevel=3
+    )
+
+
+def _get_delta_field(delta: Any, name: str) -> Any:
+    """Read a named field from a streaming delta, whether it's a mapping or an object.
+
+    Args:
+        delta: A mapping (e.g. parsed JSON dict) or an object with attributes (e.g. an SDK model).
+        name: The field name to read.
+
+    Returns:
+        The field value, or `None` if absent.
+    """
+    if isinstance(delta, Mapping):
+        return delta.get(name)
+    return getattr(delta, name, None)
+
+
+def delta_has_reasoning_content(delta: Any) -> bool:
+    """Check whether an OpenAI-style streaming `delta` carries reasoning/thinking content.
+
+    The OpenAI Chat Completions schema has no standard field for reasoning tokens, so providers
+    and proxies each added their own. This checks the field names in common use:
+
+    * `reasoning_content` - DeepSeek, vLLM, SGLang, Bedrock Mantle (`gpt-oss`), and LiteLLM's
+      normalized form
+    * `reasoning` - OpenRouter and several OpenAI-compatible gateways
+    * `thinking_blocks` - LiteLLM's structured form for Anthropic-style thinking blocks
+
+    Only presence is reported, not the content itself: LLMeter uses reasoning deltas purely to
+    time [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] and never adds them to
+    `response_text`.
+
+    Values are type-checked (non-empty `str`, or non-empty `list`/`tuple` for `thinking_blocks`)
+    rather than merely tested for truthiness, so that sentinel or placeholder attribute values are
+    not mistaken for real reasoning output.
+
+    Args:
+        delta: The `delta` from a streaming chunk choice. Both shapes work, so this is usable from
+            custom endpoints that parse raw SSE JSON as well as from SDK-backed ones:
+
+            * a **mapping**, read with `.get()` - e.g. `{"reasoning_content": "..."}`
+            * an **object**, read with `getattr()` - plain objects, pydantic models, and models
+              carrying the fields as permitted "extras" (both the `openai` and `litellm` delta
+              types work, including fields their SDK version does not declare)
+
+    Returns:
+        `True` if the delta carries any recognized reasoning content.
+    """
+    for name in ("reasoning_content", "reasoning"):
+        value = _get_delta_field(delta, name)
+        if isinstance(value, str) and value:
+            return True
+    blocks = _get_delta_field(delta, "thinking_blocks")
+    if isinstance(blocks, (list, tuple)) and blocks:
+        return True
+    return False
 
 
 TRawResponse = TypeVar("TRawResponse", bound=Any)

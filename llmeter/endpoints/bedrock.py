@@ -34,7 +34,7 @@ from ..prompt_utils import (
     MediaContent,
     VideoContent,
 )
-from .base import Endpoint, InvocationResponse
+from .base import Endpoint, InvocationResponse, warn_if_ttft_visible_tokens_only_set
 
 logger = logging.getLogger(__name__)
 
@@ -355,13 +355,9 @@ class BedrockConverse(BedrockBase[ConverseResponseTypeDef]):
 class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
     """Streaming endpoint for the Bedrock Converse API.
 
-    When extended thinking is enabled, the stream contains `reasoningContent` deltas before the
-    visible `text` deltas.  The `ttft_visible_tokens_only` parameter controls which delta sets
-    `time_to_first_token`:
-
-    * `True` (default) - TTFT is set on the first `text` delta. Reasoning deltas are ignored for
-      timing.
-    * `False` - TTFT is set on the first delta of any kind, including reasoning content.
+    Supports collecting both [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] and
+    [`time_to_first_content_token`][llmeter.endpoints.base.InvocationResponse] where reasoning is
+    emitted by the model.
 
     Args:
         model_id: Bedrock model identifier.
@@ -370,8 +366,11 @@ class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
         inference_config: Default inference configuration.
         bedrock_boto3_client: Pre-configured boto3 client.
         max_attempts: Maximum retry attempts.  Defaults to 3.
-        ttft_visible_tokens_only: When `True` (default), TTFT measures time to first visible text
-            token.  When `False`, TTFT includes reasoning content deltas.
+        ttft_visible_tokens_only: **Deprecated and ignored.**  In current LLMeter,
+            [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] is recorded when
+            *any* token is received (including internal thinking/reasoning), and
+            [`time_to_first_content_token`][llmeter.endpoints.base.InvocationResponse] when an
+            actual output token is received. Since both are now recorded this param is ignored.
     """
 
     def __init__(
@@ -382,7 +381,7 @@ class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
         inference_config: dict | None = None,
         bedrock_boto3_client=None,
         max_attempts: int = 3,
-        ttft_visible_tokens_only: bool = True,
+        ttft_visible_tokens_only: bool | None = None,
     ):
         super().__init__(
             model_id=model_id,
@@ -392,7 +391,7 @@ class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
             bedrock_boto3_client=bedrock_boto3_client,
             max_attempts=max_attempts,
         )
-        self.ttft_visible_tokens_only = ttft_visible_tokens_only
+        warn_if_ttft_visible_tokens_only_set(ttft_visible_tokens_only)
 
     @Endpoint.llmeter_invoke
     def invoke(self, payload: dict):
@@ -404,8 +403,8 @@ class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
     ) -> None:
         """Parse the streaming response from a Bedrock ConverseStream API call.
 
-        Only `text` deltas contribute to `response_text`. `reasoningContent` deltas are used solely
-        for TTFT measurement when `ttft_visible_tokens_only` is `False`.
+        Only `text` deltas contribute to `response_text`. `reasoningContent` deltas are timed (they
+        can set `time_to_first_token`) but their content is discarded.
 
         Args:
             raw_response: The raw response from the Bedrock API.
@@ -422,12 +421,9 @@ class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
                 delta = chunk["contentBlockDelta"]["delta"]
 
                 if "reasoningContent" in delta:
-                    # Reasoning delta -- only counts for TTFT when
-                    # ttft_visible_tokens_only is False.
-                    if (
-                        not self.ttft_visible_tokens_only
-                        and response.time_to_first_token is None
-                    ):
+                    # Reasoning deltas count as output tokens for TTFT, but are not visible
+                    # content and never contribute to `response_text`.
+                    if response.time_to_first_token is None:
                         response.time_to_first_token = now - start_t
 
                 elif "text" in delta:
@@ -437,6 +433,8 @@ class BedrockConverseStream(BedrockBase[ConverseStreamResponseTypeDef]):
                     if delta_text:
                         if response.time_to_first_token is None:
                             response.time_to_first_token = now - start_t
+                        if response.time_to_first_content_token is None:
+                            response.time_to_first_content_token = now - start_t
                         if response.response_text is None:
                             response.response_text = delta_text
                         else:

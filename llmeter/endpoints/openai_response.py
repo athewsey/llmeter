@@ -18,7 +18,7 @@ from openai.types.responses.response_create_params import (
 )
 
 # Local Dependencies:
-from .base import Endpoint, InvocationResponse
+from .base import Endpoint, InvocationResponse, warn_if_ttft_visible_tokens_only_set
 
 logger = logging.getLogger(__name__)
 
@@ -304,13 +304,9 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
     This endpoint provides streaming access to OpenAI's Responses API, enabling time-to-first-token
     measurements and incremental response processing.
 
-    Args:
-        ttft_visible_tokens_only: Controls how `time_to_first_token` is measured for reasoning
-            models. When `True` (default), TTFT records the time to the first *visible* text token
-            (`response.output_text.delta`), ignoring reasoning events. When `False`, TTFT records
-            the time to the first token of any kind — including reasoning summary or reasoning text
-            deltas — giving a measure of when the model first started producing output. Has no
-            effect for non-reasoning models.
+    Supports collecting both [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] and
+    [`time_to_first_content_token`][llmeter.endpoints.base.InvocationResponse] where reasoning is
+    emitted by the model.
     """
 
     def __init__(
@@ -319,7 +315,7 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
         endpoint_name: str = "openai-response-stream",
         api_key: str | None = None,
         provider: str = "openai",
-        ttft_visible_tokens_only: bool = True,
+        ttft_visible_tokens_only: bool | None = None,
         organization: str | None = None,
         project: str | None = None,
         base_url: str | httpx.URL | None = None,
@@ -337,8 +333,11 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
             endpoint_name: Name of the endpoint (default: "openai-response-stream")
             api_key: OpenAI API key (optional, uses OPENAI_API_KEY env var if not provided)
             provider: Provider name (default: "openai")
-            ttft_visible_tokens_only: When True (default), TTFT measures time to first visible text
-                token. When False, TTFT includes reasoning token events.
+            ttft_visible_tokens_only: **Deprecated and ignored.**  In current LLMeter,
+                [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] is recorded when
+                *any* token is received (including internal thinking/reasoning), and
+                [`time_to_first_content_token`][llmeter.endpoints.base.InvocationResponse] when an
+                actual output token is received. Since both are now recorded this param is ignored.
             organization: OpenAI organization ID. Defaults to None.
             project: OpenAI project ID. Defaults to None.
             base_url: Override the default base URL for the API.
@@ -364,7 +363,7 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
             default_query=default_query,
             **kwargs,
         )
-        self.ttft_visible_tokens_only = ttft_visible_tokens_only
+        warn_if_ttft_visible_tokens_only_set(ttft_visible_tokens_only)
 
     @OpenAIEndpointBase.llmeter_invoke
     def invoke(self, payload: ResponseCreateParamsStreaming):
@@ -391,12 +390,13 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
         Processes typed events from the stream:
 
         - `ResponseCreatedEvent`: captures `response.id`
-        - `ResponseTextDeltaEvent`: accumulates text deltas, records TTFT
+        - `ResponseTextDeltaEvent`: accumulates text deltas, records `time_to_first_token` and
+          `time_to_first_content_token`
         - `ResponseCompletedEvent`: extracts usage from `response.usage`
         - `ResponseFailedEvent`: captures API-level errors
         - Reasoning events (`response.reasoning_summary_text.delta`,
-          `response.reasoning_text.delta`): when `ttft_visible_tokens_only` is ``False``, these set
-          TTFT on the first reasoning token.
+          `response.reasoning_text.delta`): record `time_to_first_token` only. Their content is
+          discarded and never contributes to `response_text`.
         """
         _REASONING_DELTA_TYPES = frozenset(
             (
@@ -413,16 +413,15 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
             elif event.type == "response.output_text.delta":
                 if response.response_text is None:
                     response.response_text = event.delta
-                    if response.time_to_first_token is None:
-                        response.time_to_first_token = now - start_t
                 else:
                     response.response_text += event.delta
+                if response.time_to_first_token is None:
+                    response.time_to_first_token = now - start_t
+                if response.time_to_first_content_token is None:
+                    response.time_to_first_content_token = now - start_t
                 response.time_to_last_token = now - start_t
 
-            elif (
-                not self.ttft_visible_tokens_only
-                and event.type in _REASONING_DELTA_TYPES
-            ):
+            elif event.type in _REASONING_DELTA_TYPES:
                 if response.time_to_first_token is None:
                     response.time_to_first_token = now - start_t
 

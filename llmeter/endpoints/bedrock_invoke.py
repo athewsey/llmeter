@@ -282,6 +282,7 @@ class BedrockInvokeStream(
         bedrock_boto3_client: Any = None,
         max_attempts: int = 3,
         generated_text_jmespath: str = "choices[0].delta.content",
+        reasoning_text_jmespath: str | None = "choices[0].delta.reasoning_content",
         generated_token_count_jmespath: str
         | None = '"amazon-bedrock-invocationMetrics".outputTokenCount',
         input_text_jmespath: str = "messages[].content[].text",
@@ -306,7 +307,15 @@ class BedrockInvokeStream(
             max_attempts:
                 Maximum number of retry attempts. Defaults to 3.
             generated_text_jmespath:
-                JMESPath query to extract incremental text from *a chunk of* the model response.
+                JMESPath query to extract incremental *visible* text from *a chunk of* the model
+                response. Matching chunks set both `time_to_first_token` and
+                `time_to_first_content_token`, and accumulate into `response_text`.
+            reasoning_text_jmespath:
+                JMESPath query to extract incremental *reasoning* text from *a chunk of* the model
+                response. Matching chunks set `time_to_first_token` only - reasoning content is
+                never added to `response_text`. Set to `None` to disable, in which case
+                `time_to_first_token` will equal `time_to_first_content_token` even for reasoning
+                models.
             generated_token_count_jmespath:
                 JMESPath query to extract generated token count from *a chunk of* model response.
             input_text_jmespath:
@@ -325,6 +334,7 @@ class BedrockInvokeStream(
             input_text_jmespath=input_text_jmespath,
             input_token_count_jmespath=input_token_count_jmespath,
         )
+        self.reasoning_text_jmespath = reasoning_text_jmespath
 
     @BedrockInvokeBase.llmeter_invoke
     def invoke(self, payload: dict):
@@ -361,6 +371,7 @@ class BedrockInvokeStream(
         response.id = resp_meta.get("RequestId")
         response.retries = resp_meta.get("RetryAttempts")
         response.time_to_first_token = None
+        response.time_to_first_content_token = None
         response.time_to_last_token = None
 
         for event in raw_response["body"]:
@@ -376,11 +387,26 @@ class BedrockInvokeStream(
                 if chunk_text:
                     if response.time_to_first_token is None:
                         response.time_to_first_token = now - start_t
+                    if response.time_to_first_content_token is None:
+                        response.time_to_first_content_token = now - start_t
                     response.time_to_last_token = now - start_t
                     if response.response_text is None:
                         response.response_text = chunk_text
                     else:
                         response.response_text += chunk_text
+                elif (
+                    response.time_to_first_token is None
+                    and self.reasoning_text_jmespath
+                ):
+                    # Reasoning-only chunk: times TTFT, but is not visible content so it never
+                    # contributes to `response_text`.
+                    reasoning_text = jmespath.search(
+                        self.reasoning_text_jmespath, chunk_data
+                    )
+                    if isinstance(reasoning_text, list):
+                        reasoning_text = "".join(reasoning_text)
+                    if reasoning_text:
+                        response.time_to_first_token = now - start_t
                 chunks.append(chunk_data)
             else:
                 # Non-chunk events: check for Bedrock error events, skip
