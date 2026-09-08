@@ -248,6 +248,9 @@ class TestLiteLLM:
         assert result.response_text == "Test response"
         assert result.num_tokens_input == 15
         assert result.num_tokens_output == 8
+        # Non-streaming: neither first-token metric is measurable
+        assert result.time_to_first_token is None
+        assert result.time_to_first_content_token is None
 
     def test_process_raw_response_no_usage(self):
         """Test process_raw_response without usage info."""
@@ -517,7 +520,7 @@ def _stream(chunks):
     return stream
 
 
-class TestLiteLLMStreamingReasoning:
+class TestLiteLLMStreamingFirstTokenMetrics:
     def setup_method(self):
         with patch("llmeter.endpoints.litellm.get_llm_provider") as mock_get_provider:
             mock_get_provider.return_value = ("gpt-3.5-turbo", "openai", None, None)
@@ -603,3 +606,126 @@ class TestLiteLLMStreamingReasoning:
         assert response.response_text == "Hi"
         assert response.num_tokens_input == 7
         assert response.num_tokens_output == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning_type resolution, across both LiteLLM endpoints
+# ---------------------------------------------------------------------------
+
+
+def _sync_response(**message_attrs):
+    """A non-streaming LiteLLM response whose message may carry reasoning fields."""
+    message = SimpleNamespace(content="Answer", **message_attrs)
+    return SimpleNamespace(
+        id="resp-1",
+        choices=[SimpleNamespace(message=message)],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=20),
+    )
+
+
+def _stream_for_shape(shape: str):
+    chunks = {
+        "reasoning_content": [_ns_chunk(reasoning_content="thinking")],
+        "thinking_blocks": [
+            _ns_chunk(thinking_blocks=[{"type": "thinking", "thinking": "hmm"}])
+        ],
+        "none": [],
+    }[shape]
+    return _stream([*chunks, _ns_chunk(content="Answer")])
+
+
+def _sync_for_shape(shape: str):
+    attrs = {
+        "reasoning_content": {"reasoning_content": "thinking"},
+        "thinking_blocks": {
+            "thinking_blocks": [{"type": "thinking", "thinking": "hmm"}]
+        },
+        "none": {},
+    }[shape]
+    return _sync_response(**attrs)
+
+
+#: Parametrising over the transport is the point: LiteLLM normalizes reasoning onto the same fields
+#: for both, so streaming and non-streaming must resolve equivalent content identically.
+_MODES = {
+    "streaming": (LiteLLMStreaming, _stream_for_shape),
+    "non-streaming": (LiteLLM, _sync_for_shape),
+}
+
+_SHAPES = ("reasoning_content", "thinking_blocks", "none")
+
+
+def _resolve(mode: str, shape: str, litellm_model="openai/gpt-oss-120b", declared=None):
+    endpoint_cls, build = _MODES[mode]
+    with patch("llmeter.endpoints.litellm.get_llm_provider") as mock_provider:
+        mock_provider.return_value = (litellm_model, "openai", None, None)
+        endpoint = endpoint_cls(
+            litellm_model=litellm_model, default_reasoning_visibility=declared
+        )
+    response = InvocationResponse(response_text=None)
+    endpoint.process_raw_response(build(shape), time.perf_counter(), response)
+    return response
+
+
+class TestLiteLLMReasoningTypeResolution:
+    """LiteLLM exposes no fidelity marker, so resolution comes from the model string or a declaration.
+
+    Covers the non-streaming endpoint too: it records `reasoning_type` from the response message,
+    which was previously untested even though the library sets it.
+    """
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "shape,expected",
+        [
+            ("reasoning_content", "verbatim"),
+            ("thinking_blocks", "verbatim"),
+            # No reasoning at all must stay unset, *not* take the endpoint's default
+            ("none", None),
+        ],
+    )
+    def test_resolution_by_content_shape(self, mode, shape, expected):
+        assert _resolve(mode, shape).reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "litellm_model,expected",
+        [
+            ("anthropic/claude-sonnet-4-6", "summary"),
+            ("bedrock/anthropic.claude-opus-4-6", "summary"),
+            ("deepseek/deepseek-reasoner", "verbatim"),
+            ("openai/gpt-oss-120b", "verbatim"),
+        ],
+    )
+    def test_inferred_from_provider_prefix(self, mode, litellm_model, expected):
+        response = _resolve(mode, "reasoning_content", litellm_model=litellm_model)
+        assert response.reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "declared,expected",
+        [
+            ("verbatim", "verbatim"),
+            ("summary", "summary"),
+            # Declining is explicit, and must still record that reasoning happened
+            ("unknown", "unknown"),
+        ],
+    )
+    def test_declared_visibility_overrides_inference(self, mode, declared, expected):
+        response = _resolve(
+            mode,
+            "reasoning_content",
+            litellm_model="anthropic/claude-3-7-sonnet",
+            declared=declared,
+        )
+        assert response.reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize("shape", _SHAPES)
+    def test_reasoning_never_leaks_into_response_text(self, mode, shape):
+        assert _resolve(mode, shape).response_text == "Answer"
+
+    def test_non_streaming_records_no_first_token_metrics(self):
+        response = _resolve("non-streaming", "reasoning_content")
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None

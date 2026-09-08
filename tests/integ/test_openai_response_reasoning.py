@@ -44,6 +44,7 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+from ._prompts import SIMPLE_ANSWER, SIMPLE_PROMPT
 from llmeter.endpoints.openai_response import (
     OpenAIResponseEndpoint,
     OpenAIResponseStreamEndpoint,
@@ -104,7 +105,7 @@ def test_response_non_streaming_reasoning_tokens(
     )
 
     payload = OpenAIResponseEndpoint.create_payload(
-        user_message="What is 15 * 37? Reply with just the number.",
+        user_message=SIMPLE_PROMPT,
         max_output_tokens=200,
     )
 
@@ -117,8 +118,8 @@ def test_response_non_streaming_reasoning_tokens(
     # Verify response text
     assert response.response_text is not None, "Response text should not be None"
     assert len(response.response_text) > 0, "Response text should not be empty"
-    assert "555" in response.response_text, (
-        f"Expected '555' in response, got: {response.response_text}"
+    assert SIMPLE_ANSWER in response.response_text, (
+        f"Expected {SIMPLE_ANSWER!r} in response, got: {response.response_text}"
     )
 
     # Verify token counts
@@ -174,7 +175,7 @@ def test_response_streaming_reasoning_first_token_metrics(
     )
 
     payload = OpenAIResponseEndpoint.create_payload(
-        user_message="What is 15 * 37? Reply with just the number.",
+        user_message=SIMPLE_PROMPT,
         max_output_tokens=200,
     )
 
@@ -186,8 +187,8 @@ def test_response_streaming_reasoning_first_token_metrics(
 
     # Verify response text
     assert response.response_text is not None, "Response text should not be None"
-    assert "555" in response.response_text, (
-        f"Expected '555' in response, got: {response.response_text}"
+    assert SIMPLE_ANSWER in response.response_text, (
+        f"Expected {SIMPLE_ANSWER!r} in response, got: {response.response_text}"
     )
 
     # Verify timing. Both metrics come from the same stream, so the ordering is exact -
@@ -237,7 +238,7 @@ def test_response_streaming_reasoning_precedes_visible_text(
         base_url=_mantle_base_url(aws_region),
     )
     payload = OpenAIResponseEndpoint.create_payload(
-        user_message="What is 15 * 37? Reply with just the number.",
+        user_message=SIMPLE_PROMPT,
         max_output_tokens=200,
     )
 
@@ -252,3 +253,51 @@ def test_response_streaming_reasoning_precedes_visible_text(
         f"({response.time_to_first_content_token:.3f}s). Either the model streamed no "
         f"reasoning deltas, or they are no longer being detected."
     )
+
+
+@pytest.mark.integ
+@pytest.mark.skipif(not OPENAI_AVAILABLE, reason="OpenAI SDK not installed")
+def test_response_streaming_reasoning_type_is_detected(
+    aws_credentials, aws_region, reasoning_model_id
+):
+    """`reasoning_type` is derived purely from event type names, so the API can invalidate it.
+
+    This endpoint needs no declared default: `response.reasoning_text.delta` means the reasoning
+    itself, `response.reasoning_summary_text.delta` means a summary of it. If either event were
+    renamed or replaced, `reasoning_type` would silently fall back to `None` -- which the Runner
+    reads as "this model did no reasoning" and would use to select the whole-output TPOT pairing.
+
+    Deliberately asserts membership rather than one exact value: which of the two a given model
+    emits is a model/deployment property, and pinning it would make this test brittle for no gain.
+
+    Estimated Cost: ~$0.001 per run
+    """
+    token = provide_token(region=aws_region)
+
+    endpoint = OpenAIResponseStreamEndpoint(
+        model_id=reasoning_model_id,
+        api_key=token,
+        base_url=_mantle_base_url(aws_region),
+    )
+    payload = OpenAIResponseEndpoint.create_payload(
+        user_message=SIMPLE_PROMPT,
+        max_output_tokens=200,
+    )
+
+    response = endpoint.invoke(payload)
+
+    assert response.error is None, f"Response error: {response.error}"
+    assert response.reasoning_type in ("verbatim", "summary"), (
+        f"A reasoning model should yield a detected disclosure level, got "
+        f"{response.reasoning_type!r}. `None` here means neither reasoning event type was "
+        f"recognized -- check whether the Responses API event names have changed."
+    )
+
+    # Whichever it is, reasoning arrived before the answer
+    assert response.time_to_first_token < response.time_to_first_content_token
+
+    # And it is consistent with the reasoning token count the API reported
+    if response.num_tokens_output_reasoning is not None:
+        assert response.num_tokens_output_reasoning > 0, (
+            "A response with detected reasoning deltas should report reasoning tokens"
+        )

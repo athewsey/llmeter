@@ -15,12 +15,16 @@ Covers:
 """
 
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
 from llmeter.endpoints.base import InvocationResponse
-from llmeter.endpoints.openai_response import OpenAIResponseStreamEndpoint
+from llmeter.endpoints.openai_response import (
+    OpenAIResponseEndpoint,
+    OpenAIResponseStreamEndpoint,
+)
 
 
 def _make_draft_response() -> InvocationResponse:
@@ -328,3 +332,129 @@ class TestReasoningTokenCount:
         assert response.num_tokens_input_cached == 60
         assert response.num_tokens_input == 100
         assert response.num_tokens_output == 50
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning_type resolution, across both Responses endpoints
+# ---------------------------------------------------------------------------
+
+
+def _reasoning_item(content=None, summary=None):
+    return SimpleNamespace(type="reasoning", content=content, summary=summary)
+
+
+def _sync_response(output_items):
+    return SimpleNamespace(
+        id="resp_1", output_text="Answer", output=output_items, usage=None
+    )
+
+
+def _stream_for_shape(shape: str):
+    events = {
+        "verbatim": [_reasoning_text_delta_event()],
+        "summary": [_reasoning_summary_delta_event()],
+        # Both present: the summary arrived first and set TTFT, so it is not safe to claim verbatim
+        "mixed": [_reasoning_summary_delta_event(), _reasoning_text_delta_event()],
+        "none": [],
+    }[shape]
+    return iter(
+        [_created_event(), *events, _text_delta_event("Answer"), _completed_event()]
+    )
+
+
+def _sync_for_shape(shape: str):
+    items = {
+        "verbatim": [_reasoning_item(content=[SimpleNamespace(text="t")])],
+        "summary": [_reasoning_item(summary=[SimpleNamespace(text="s")])],
+        "mixed": [
+            _reasoning_item(summary=[SimpleNamespace(text="s")]),
+            _reasoning_item(content=[SimpleNamespace(text="t")]),
+        ],
+        "none": [SimpleNamespace(type="message")],
+    }[shape]
+    return _sync_response(items)
+
+
+#: The Responses API states the disclosure level in the response itself - as event types when
+#: streaming, and as reasoning-item fields when not - so this endpoint needs no declared default.
+#: Parametrising over the transport keeps the two readings in agreement, *except* for mixed
+#: disclosure, where they intentionally differ (see the two dedicated tests below).
+_MODES = {
+    "streaming": (OpenAIResponseStreamEndpoint, _stream_for_shape),
+    "non-streaming": (OpenAIResponseEndpoint, _sync_for_shape),
+}
+
+
+def _resolve(mode: str, shape: str):
+    endpoint_cls, build = _MODES[mode]
+    endpoint = endpoint_cls(model_id="test-model")
+    response = _make_draft_response()
+    endpoint.process_raw_response(build(shape), time.perf_counter(), response)
+    return response
+
+
+@patch("llmeter.endpoints.openai_response.OpenAI")
+class TestResponsesReasoningTypeResolution:
+    """Disclosure level is fully observable here, so no `default_reasoning_visibility` exists."""
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "shape,expected",
+        [
+            ("verbatim", "verbatim"),
+            ("summary", "summary"),
+            # No reasoning at all must stay unset
+            ("none", None),
+        ],
+    )
+    def test_resolution_by_content_shape(self, mock_openai, mode, shape, expected):
+        assert _resolve(mode, shape).reasoning_type == expected
+
+    def test_streaming_mixed_disclosure_downgrades_to_summary(self, mock_openai):
+        """Streaming: the summary arrived *first*, so it is what anchored TTFT.
+
+        Claiming `"verbatim"` would let the Runner pair the whole measured window against the full
+        output token count, when the window actually begins at a summary delta.
+        """
+        assert _resolve("streaming", "mixed").reasoning_type == "summary"
+
+    def test_non_streaming_mixed_disclosure_is_verbatim(self, mock_openai):
+        """Non-streaming deliberately differs, and it is *not* an inconsistency.
+
+        The streaming downgrade exists purely to protect the TPOT pairing, which depends on what
+        anchored TTFT. A non-streaming response has no first-token timings at all, so there is no
+        pairing to protect - and the raw reasoning genuinely is present, so `"verbatim"` is the more
+        accurate description of what the provider disclosed.
+        """
+        assert _resolve("non-streaming", "mixed").reasoning_type == "verbatim"
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_reasoning_never_leaks_into_response_text(self, mock_openai, mode):
+        for shape in ("verbatim", "summary", "mixed", "none"):
+            assert _resolve(mode, shape).response_text == "Answer", shape
+
+    def test_non_streaming_reasoning_item_disclosing_nothing_is_redacted(
+        self, mock_openai
+    ):
+        """A reasoning item with neither raw content nor a summary withheld both."""
+        endpoint = OpenAIResponseEndpoint(model_id="test-model")
+        response = _make_draft_response()
+        endpoint.process_raw_response(
+            _sync_response([_reasoning_item()]), time.perf_counter(), response
+        )
+        assert response.reasoning_type == "redacted"
+
+    def test_non_streaming_records_no_first_token_metrics(self, mock_openai):
+        response = _resolve("non-streaming", "verbatim")
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
+
+    def test_non_list_output_is_tolerated(self, mock_openai):
+        """A placeholder/mock `output` must not be iterated as if it were a list."""
+        endpoint = OpenAIResponseEndpoint(model_id="test-model")
+        response = _make_draft_response()
+        endpoint.process_raw_response(
+            _sync_response(Mock()), time.perf_counter(), response
+        )
+        assert response.error is None
+        assert response.reasoning_type is None

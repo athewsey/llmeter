@@ -7,7 +7,11 @@ import pytest
 
 import llmeter
 import llmeter.endpoints
-from llmeter.endpoints.base import Endpoint, InvocationResponse
+from llmeter.endpoints.base import (
+    Endpoint,
+    InvocationResponse,
+    infer_reasoning_visibility_from_model_id,
+)
 
 # Tests for InvocationResponse
 
@@ -291,3 +295,37 @@ def test_endpoint_load_error():
     }
     with pytest.raises(KeyError):
         ConcreteEndpoint.load(invalid_config)
+
+
+# ---------------------------------------------------------------------------
+# Tests: base-module reasoning helpers
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultReasoningVisibilityInference:
+    """The model-ID heuristic in `llmeter.endpoints.base`, independent of any endpoint.
+
+    Lives here rather than with a provider's tests because it is provider-agnostic: it handles
+    Bedrock-style `.` namespacing *and* LiteLLM-style `/` prefixes, and is used by the Bedrock,
+    OpenAI-compatible and LiteLLM endpoints alike.
+    """
+
+    @pytest.mark.parametrize(
+        "model_id,expected",
+        [
+            ("anthropic.claude-opus-4-7", "summary"),
+            ("us.anthropic.claude-sonnet-4-6", "summary"),
+            ("global.anthropic.claude-opus-4-7", "summary"),
+            ("openai.gpt-oss-120b-1:0", "verbatim"),
+            ("qwen.qwen3-32b-v1:0", "verbatim"),
+            ("deepseek.r1-v1:0", "verbatim"),
+            # Substring matches must not count -- only whole dot-separated segments
+            ("acme.anthropic-lookalike-v1", "verbatim"),
+            # LiteLLM-style provider prefixes use "/" rather than "."
+            ("bedrock/anthropic.claude-opus-4-6", "summary"),
+            ("anthropic/claude-sonnet-4-6", "summary"),
+            ("openai/gpt-4", "verbatim"),
+        ],
+    )
+    def test_inference_from_model_id(self, model_id, expected):
+        assert infer_reasoning_visibility_from_model_id(model_id) == expected

@@ -118,6 +118,9 @@ def test_sagemaker_endpoint_invoke(sagemaker_endpoint: SageMakerEndpoint):
     assert response.num_tokens_output == 10
     assert isinstance(response.id, str)
     assert len(response.id) > 0
+    # Non-streaming: neither first-token metric is measurable
+    assert response.time_to_first_token is None
+    assert response.time_to_first_content_token is None
 
 
 @patch("time.perf_counter")

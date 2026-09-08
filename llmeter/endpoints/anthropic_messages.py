@@ -62,10 +62,11 @@ LLMeter records two first-token metrics for streaming responses:
 * [`InvocationResponse.time_to_first_content_token`][llmeter.endpoints.base.InvocationResponse] -
   the first visible `text_delta`, which for a thinking model includes the whole thinking phase.
 
-With `display: "omitted"` the first thinking token is never streamed, so `time_to_first_token` is
-reported as `None` rather than being approximated from the trailing `signature_delta`. See
-[`AnthropicMessagesStream`][llmeter.endpoints.anthropic_messages.AnthropicMessagesStream] for the
-full rationale and for the `annotations` key that preserves the signature timing.
+With `display: "omitted"` no thinking token is ever streamed, so `time_to_first_token` records the
+trailing `signature_delta` instead - the first model output actually received. That arrives *after*
+thinking completes, making it a poor proxy for when generation started, which is precisely what the
+accompanying [`reasoning_type`][llmeter.endpoints.base.ReasoningType] of `"redacted"` flags. See
+[`AnthropicMessagesStream`][llmeter.endpoints.anthropic_messages.AnthropicMessagesStream] for detail.
 """
 
 # Python Built-Ins:
@@ -84,7 +85,12 @@ from anthropic.types import (
 import httpx  # (Indirect dependency of anthropic)
 
 # Local Dependencies:
-from .base import Endpoint, InvocationResponse, warn_if_ttft_visible_tokens_only_set
+from .base import (
+    Endpoint,
+    InvocationResponse,
+    ReasoningType,
+    warn_if_ttft_visible_tokens_only_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +159,9 @@ class AnthropicMessagesEndpoint(
             ``max_retries``, ``timeout``).
     """
 
+    # Explicit typing to keep pyright happy:
+    default_reasoning_visibility: ReasoningType | None
+
     def __init__(
         self,
         model_id: str,
@@ -160,6 +169,7 @@ class AnthropicMessagesEndpoint(
         provider: str = "anthropic",
         api_key: str | None = None,
         aws_region: str | None = None,
+        default_reasoning_visibility: ReasoningType | None = None,
         **kwargs: Any,
     ):
         super().__init__(
@@ -167,6 +177,9 @@ class AnthropicMessagesEndpoint(
             model_id=model_id,
             provider=provider,
         )
+        # Note we deliberately allow passing None to mean "use this endpoint's default" in line
+        # with other endpoints - but for Claude this default is "summary" (correct since Claude 4):
+        self.default_reasoning_visibility = default_reasoning_visibility or "summary"
         self.aws_region = aws_region
         client_cls = _ANTHROPIC_CLIENTS.get(provider)
         if client_cls is None:
@@ -437,12 +450,26 @@ class AnthropicMessages(AnthropicMessagesEndpoint[Message]):
         response.time_to_last_token = time.perf_counter() - start_t
         response.id = raw_response.id
 
-        # Extract text from content blocks (skip thinking/redacted_thinking)
+        # Extract text from content blocks (skip thinking/redacted_thinking), noting whether the
+        # model reasoned and how that reasoning was disclosed. Non-streaming responses have no
+        # first-token timings, but the disclosure level is still meaningful information about the
+        # request - and `num_tokens_output_reasoning` is captured below regardless.
         response_text = ""
+        saw_thinking_block = False
+        saw_redacted_thinking_block = False
         for block in raw_response.content:
             if block.type == "text":
                 response_text += block.text
+            elif block.type == "thinking":
+                saw_thinking_block = True
+            elif block.type == "redacted_thinking":
+                saw_redacted_thinking_block = True
         response.response_text = response_text
+
+        if saw_redacted_thinking_block:
+            response.reasoning_type = "redacted"
+        elif saw_thinking_block:
+            response.reasoning_type = self.default_reasoning_visibility or "unknown"
 
         usage = raw_response.usage
         if usage:
@@ -479,16 +506,19 @@ class AnthropicMessagesStream(
       populated as described above.
     * `"omitted"` (the default on Claude Opus 4.7 and Mythos) - no `thinking_delta` events are
       emitted at all. The only pre-text signal is a `signature_delta`, which arrives *after*
-      thinking is complete. Because the genuine first-token time is therefore unobservable,
-      `time_to_first_token` is set to **`None`**. `time_to_first_content_token` and
-      `time_to_last_token` remain accurate, and
-      [`time_per_output_token`][llmeter.endpoints.base.InvocationResponse] is still derived, from
-      the visible-token pairing that `num_tokens_output_reasoning` makes possible.
+      thinking is complete. `time_to_first_token` records it anyway, since it is the first model
+      output received - but being an end-of-thinking timestamp it is a poor proxy for when
+      generation started, and is not comparable with TTFT from a model that streams its reasoning.
+      [`reasoning_type`][llmeter.endpoints.base.ReasoningType] is set to `"redacted"` to make that
+      visible, and is what stops
+      [`time_per_output_token`][llmeter.endpoints.base.InvocationResponse] being derived from the
+      whole measured window. TPOT is still available, from the answer-only pairing that
+      `num_tokens_output_reasoning` makes possible.
 
-    In `"omitted"` mode the signature arrival time is still recorded, as
-    `annotations["anthropic_time_to_thinking_signature"]`, since it is a useful upper bound on when
-    thinking finished. It is deliberately *not* reported as `time_to_first_token`: doing so would
-    understate the prefill latency TTFT is meant to isolate.
+    A `redacted_thinking` block is treated the same way: it arrives whole (the Messages API has no
+    redacted-thinking *delta* type), so it too sets `time_to_first_token` and yields `"redacted"`.
+    Partial redaction - readable thinking *and* a redacted block - also resolves to `"redacted"`,
+    conservatively, because some of the reasoning was not delivered as plain text.
 
     !!! note
         To measure first-token latency on a model that defaults to `display: "omitted"`, request
@@ -500,6 +530,14 @@ class AnthropicMessagesStream(
         provider: Backend to use.  Defaults to `"anthropic"`.
         api_key: API key for the direct Anthropic API.
         aws_region: AWS region for Bedrock Mantle.
+        default_reasoning_visibility: What to record as
+            [`reasoning_type`][llmeter.endpoints.base.InvocationResponse] when thinking deltas
+            *are* streamed. Defaults to `"summary"`, which is correct for Claude 4 models (they
+            return summarized thinking). **Set this to `"verbatim"` for Claude 3.7 Sonnet**, which
+            returns the full thinking output - the stream is identical in both cases, so LLMeter
+            cannot detect the difference. Pass `"unknown"` to decline guessing. Has no effect when
+            thinking is not streamed at all: that case is detected structurally and always recorded
+            as `"redacted"`.
         ttft_visible_tokens_only: **Deprecated and ignored.** Both first-token metrics are now
             always recorded. Accepted only so that endpoint configurations saved by earlier
             LLMeter versions continue to load.
@@ -530,6 +568,7 @@ class AnthropicMessagesStream(
         provider: str = "anthropic",
         api_key: str | None = None,
         aws_region: str | None = None,
+        default_reasoning_visibility: ReasoningType | None = None,
         ttft_visible_tokens_only: bool | None = None,
         **kwargs: Any,
     ):
@@ -539,6 +578,7 @@ class AnthropicMessagesStream(
             provider=provider,
             api_key=api_key,
             aws_region=aws_region,
+            default_reasoning_visibility=default_reasoning_visibility,
             **kwargs,
         )
         warn_if_ttft_visible_tokens_only_set(ttft_visible_tokens_only)
@@ -575,7 +615,8 @@ class AnthropicMessagesStream(
             response: The LLMeter response object to be populated in-place.
         """
         saw_thinking_delta = False
-        time_to_thinking_signature: float | None = None
+        saw_thinking_signature = False
+        saw_redacted_thinking_block = False
 
         for event in raw_response:
             now = time.perf_counter()
@@ -591,6 +632,21 @@ class AnthropicMessagesStream(
                         event.message.usage, "cache_read_input_tokens", None
                     )
 
+            elif event_type == "content_block_start":
+                # `redacted_thinking` blocks arrive *whole* through this event: the Messages API has
+                # no redacted-thinking delta type, so without handling it an entirely-redacted
+                # thinking block is invisible. There would be no `thinking_delta`, and no
+                # `signature_delta` either (the block carries `data`, not `signature`), so the
+                # response would be silently mislabelled as having done no reasoning at all -- and
+                # TTFT would be taken from the first *text* delta.
+                block_type = getattr(
+                    getattr(event, "content_block", None), "type", None
+                )
+                if block_type == "redacted_thinking":
+                    saw_redacted_thinking_block = True
+                    if response.time_to_first_token is None:
+                        response.time_to_first_token = now - start_t
+
             elif event_type == "content_block_delta":
                 delta = event.delta
                 delta_type = getattr(delta, "type", None)
@@ -602,10 +658,14 @@ class AnthropicMessagesStream(
                         response.time_to_first_token = now - start_t
 
                 elif delta_type == "signature_delta":
-                    # Not a token: the signature is emitted *after* the thinking block is
-                    # complete. Recorded for reference, but never used as a first-token time.
-                    if time_to_thinking_signature is None:
-                        time_to_thinking_signature = now - start_t
+                    # The encrypted thinking content. It arrives after the thinking block is
+                    # complete, so it is a poor proxy for when generation *started* -- but it is
+                    # still the first model output received, which is what TTFT measures. The
+                    # accompanying `reasoning_type="redacted"` is what tells consumers (and the
+                    # Runner) not to pair this TTFT against the full output token count.
+                    saw_thinking_signature = True
+                    if response.time_to_first_token is None:
+                        response.time_to_first_token = now - start_t
 
                 elif delta_type == "text_delta":
                     text = getattr(delta, "text", "")
@@ -631,18 +691,22 @@ class AnthropicMessagesStream(
                     if thinking_tokens is not None:
                         response.num_tokens_output_reasoning = thinking_tokens
 
-        if time_to_thinking_signature is not None:
-            response.annotations["anthropic_time_to_thinking_signature"] = (
-                time_to_thinking_signature
-            )
-            if not saw_thinking_delta:
-                # `display: "omitted"` -- the model demonstrably produced thinking tokens (hence
-                # the signature), but none were streamed, so the time of the genuine first output
-                # token was never observable. The first `text_delta` is *not* a valid substitute:
-                # reporting it would understate TTFT-as-prefill. Report nothing rather than a
-                # number we know to be wrong.
-                #
-                # TPOT survives this: because `num_tokens_output_reasoning` is populated from
-                # `usage.output_tokens_details.thinking_tokens`, the Runner can still derive TPOT
-                # from the visible-token pairing.
-                response.time_to_first_token = None
+        if saw_redacted_thinking_block:
+            # Positive evidence of redaction takes precedence over any declared default, including
+            # when only *part* of the thinking was redacted: the answer-only pairing is valid either
+            # way, so preferring it is the conservative choice.
+            response.reasoning_type = "redacted"
+        elif saw_thinking_delta:
+            # Thinking was streamed, but whether it is the raw reasoning or a summary of it depends
+            # on the model generation, not on anything in the stream: Claude 3.7 Sonnet returns the
+            # full thinking output, while Claude 4 models return summarized thinking. Since that is
+            # not observable here, fall back to what the caller declared (resolved in __init__).
+            # The `or` is a guard for a subclass that clears the attribute: `"unknown"` records that
+            # reasoning happened without claiming how it was disclosed, which is distinct from
+            # `None` (no reasoning at all).
+            response.reasoning_type = self.default_reasoning_visibility or "unknown"
+        elif saw_thinking_signature:
+            # `display: "omitted"`: the model demonstrably produced thinking tokens -- hence the
+            # signature -- but none of their content was streamed. Note a signature also accompanies
+            # *readable* thinking, which is why this is only reached when no thinking delta was seen.
+            response.reasoning_type = "redacted"

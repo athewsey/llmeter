@@ -12,7 +12,13 @@ from litellm import CustomStreamWrapper, completion
 from litellm.types.utils import ModelResponse
 from litellm.utils import get_llm_provider  # type: ignore
 
-from .base import Endpoint, InvocationResponse, delta_has_reasoning_content
+from .base import (
+    Endpoint,
+    InvocationResponse,
+    ReasoningType,
+    delta_has_reasoning_content,
+    infer_reasoning_visibility_from_model_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +38,20 @@ TLiteLLMResponseBase = TypeVar(
 class LiteLLMBase(Endpoint[TLiteLLMResponseBase], Generic[TLiteLLMResponseBase]):
     """Base class for (streaming or non-streaming) LiteLLM-based Endpoints"""
 
+    # Explicit typing to keep pyright happy:
+    default_reasoning_visibility: ReasoningType | None
+
     def __init__(
         self,
         litellm_model: str,
         model_id: str | None = None,
+        default_reasoning_visibility: ReasoningType | None = None,
     ):
         self.litellm_model = litellm_model
+        self.default_reasoning_visibility = (
+            default_reasoning_visibility
+            or infer_reasoning_visibility_from_model_id(litellm_model)
+        )
         model_id_inferred, provider, _, _ = get_llm_provider(litellm_model)
 
         logger.info(f"Using model {model_id_inferred} from provider {provider}")
@@ -82,7 +96,21 @@ class LiteLLMBase(Endpoint[TLiteLLMResponseBase], Generic[TLiteLLMResponseBase])
 
 
 class LiteLLM(LiteLLMBase[ModelResponse]):
-    """Endpoint for LiteLLM SDK-based models (non-streaming mode)"""
+    """Endpoint for LiteLLM SDK-based models (non-streaming mode)
+
+    Args:
+        litellm_model: The LiteLLM model string, e.g. `"anthropic/claude-sonnet-4-6"`.
+        model_id: Override for the reported model ID. Inferred from `litellm_model` if omitted.
+        default_reasoning_visibility: What to record as
+            [`reasoning_type`][llmeter.endpoints.base.InvocationResponse] when reasoning content is
+            present. LiteLLM normalizes reasoning from many providers onto the same fields, so the
+            stream carries no indication of whether it is verbatim or summarized. Defaults to a
+            guess from `litellm_model` via
+            [`infer_reasoning_visibility_from_model_id`][llmeter.endpoints.base.infer_reasoning_visibility_from_model_id],
+            which reads the provider prefix - so `"anthropic/..."` and `"bedrock/anthropic...."`
+            resolve to `"summary"`, and other providers to `"verbatim"`. Pass `"unknown"` to decline
+            guessing.
+    """
 
     @LiteLLMBase.llmeter_invoke
     def invoke(self, payload) -> ModelResponse:
@@ -111,10 +139,41 @@ class LiteLLM(LiteLLMBase[ModelResponse]):
         except AttributeError:
             pass
 
-        response.response_text = raw_response.choices[0].message.content
+        message = raw_response.choices[0].message
+        response.response_text = message.content
+        if delta_has_reasoning_content(message):
+            response.reasoning_type = self.default_reasoning_visibility or "unknown"
 
 
 class LiteLLMStreaming(LiteLLMBase[CustomStreamWrapper]):
+    """Streaming endpoint for any model reachable through LiteLLM.
+
+    Args:
+        litellm_model: The LiteLLM model string, e.g. `"anthropic/claude-sonnet-4-6"`.
+        model_id: Override for the reported model ID. Inferred from `litellm_model` if omitted.
+        default_reasoning_visibility: What to record as
+            [`reasoning_type`][llmeter.endpoints.base.InvocationResponse] when reasoning content is
+            present. LiteLLM normalizes reasoning from many providers onto the same fields, so the
+            stream carries no indication of whether it is verbatim or summarized. Defaults to a
+            guess from `litellm_model` via
+            [`infer_reasoning_visibility_from_model_id`][llmeter.endpoints.base.infer_reasoning_visibility_from_model_id],
+            which reads the provider prefix - so `"anthropic/..."` and `"bedrock/anthropic...."`
+            resolve to `"summary"`, and other providers to `"verbatim"`. Pass `"unknown"` to decline
+            guessing.
+    """
+
+    def __init__(
+        self,
+        litellm_model: str,
+        model_id: str | None = None,
+        default_reasoning_visibility: ReasoningType | None = None,
+    ):
+        super().__init__(
+            litellm_model=litellm_model,
+            model_id=model_id,
+            default_reasoning_visibility=default_reasoning_visibility,
+        )
+
     @LiteLLMBase.llmeter_invoke
     def invoke(self, payload) -> CustomStreamWrapper:
         # In streaming mode, completion always returns a CustomStreamWrapper:
@@ -151,6 +210,7 @@ class LiteLLMStreaming(LiteLLMBase[CustomStreamWrapper]):
         """
         usage = None
         got_chunk_id = False
+        saw_reasoning = False
 
         for chunk in raw_response:
             now = time.perf_counter()
@@ -174,16 +234,18 @@ class LiteLLMStreaming(LiteLLMBase[CustomStreamWrapper]):
                     else:
                         response.response_text += content
                     response.time_to_last_token = now - start_t
-                elif (
-                    response.time_to_first_token is None
-                    and delta_has_reasoning_content(delta)
-                ):
-                    response.time_to_first_token = now - start_t
+                elif delta_has_reasoning_content(delta):
+                    saw_reasoning = True
+                    if response.time_to_first_token is None:
+                        response.time_to_first_token = now - start_t
 
             try:
                 usage = chunk.usage  # type: ignore
             except AttributeError:
                 continue
+
+        if saw_reasoning:
+            response.reasoning_type = self.default_reasoning_visibility or "unknown"
 
         if usage:
             response.num_tokens_input = usage.prompt_tokens

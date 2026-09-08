@@ -34,7 +34,13 @@ from ..prompt_utils import (
     MediaContent,
     VideoContent,
 )
-from .base import Endpoint, InvocationResponse, delta_has_reasoning_content
+from .base import (
+    Endpoint,
+    InvocationResponse,
+    ReasoningType,
+    delta_has_reasoning_content,
+    infer_reasoning_visibility_from_model_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +129,16 @@ def _build_content_blocks_openai(
 class OpenAIEndpoint(Endpoint[TOpenAICompletionBase], Generic[TOpenAICompletionBase]):
     """Base class for OpenAI API endpoints."""
 
+    # Explicit typing to keep pyright happy:
+    default_reasoning_visibility: ReasoningType | None
+
     def __init__(
         self,
         model_id: str,
         endpoint_name: str = "openai",
         api_key: str | None = None,
         provider: str = "openai",
+        default_reasoning_visibility: ReasoningType | None = None,
         organization: str | None = None,
         project: str | None = None,
         base_url: str | httpx.URL | None = None,
@@ -146,6 +156,14 @@ class OpenAIEndpoint(Endpoint[TOpenAICompletionBase], Generic[TOpenAICompletionB
             endpoint_name: Name of the endpoint. Defaults to "openai".
             api_key: OpenAI API key. Defaults to None (reads from OPENAI_API_KEY env var).
             provider: Provider name. Defaults to "openai".
+            default_reasoning_visibility: What to record as
+                [`reasoning_type`][llmeter.endpoints.base.InvocationResponse] when reasoning
+                content is present. The Chat Completions schema carries no indication of whether
+                reasoning is verbatim or summarized, so it cannot be detected from the response.
+                Defaults to a guess from `model_id` via
+                [`infer_reasoning_visibility_from_model_id`][llmeter.endpoints.base.infer_reasoning_visibility_from_model_id]
+                - `"summary"` for Anthropic models (reached through a gateway), `"verbatim"`
+                otherwise. Pass `"unknown"` to decline guessing.
             organization: OpenAI organization ID. Defaults to None.
             project: OpenAI project ID. Defaults to None.
             base_url: Override the default base URL for the API.
@@ -179,6 +197,10 @@ class OpenAIEndpoint(Endpoint[TOpenAICompletionBase], Generic[TOpenAICompletionB
         if default_query is not None:
             client_kwargs["default_query"] = default_query
         self._client = OpenAI(**client_kwargs)
+        self.default_reasoning_visibility = (
+            default_reasoning_visibility
+            or infer_reasoning_visibility_from_model_id(model_id)
+        )
 
     @property
     def project(self) -> str | None:
@@ -309,7 +331,13 @@ class OpenAIEndpoint(Endpoint[TOpenAICompletionBase], Generic[TOpenAICompletionB
 
 
 class OpenAICompletionEndpoint(OpenAIEndpoint[ChatCompletion]):
-    """Endpoint for OpenAI-compatible Chat Completion APIs (non-streaming mode)"""
+    """Endpoint for OpenAI-compatible Chat Completion APIs (non-streaming mode)
+
+    Although neither time-to-first-token metric is measurable. Reasoning content that the response
+    *does* carry is still recorded on [`reasoning_type`][llmeter.endpoints.base.ReasoningType],
+    informationally: with no `time_to_first_token` there is no TPOT pairing for it to select, but
+    reporting `None` for a model that demonstrably reasoned would be misleading.
+    """
 
     @OpenAIEndpoint.llmeter_invoke
     def invoke(self, payload: CompletionCreateParamsNonStreaming) -> ChatCompletion:
@@ -333,7 +361,10 @@ class OpenAICompletionEndpoint(OpenAIEndpoint[ChatCompletion]):
         response.time_to_last_token = time.perf_counter() - start_t
         response.id = raw_response.id
 
-        response.response_text = raw_response.choices[0].message.content
+        message = raw_response.choices[0].message
+        response.response_text = message.content
+        if delta_has_reasoning_content(message):
+            response.reasoning_type = self.default_reasoning_visibility or "unknown"
 
         usage = raw_response.usage
         if usage:
@@ -350,7 +381,72 @@ class OpenAICompletionEndpoint(OpenAIEndpoint[ChatCompletion]):
 
 
 class OpenAICompletionStreamEndpoint(OpenAIEndpoint[Iterable[ChatCompletionChunk]]):
-    """Endpoint for OpenAI-compatible Chat Completion APIs (streaming mode)"""
+    """Endpoint for OpenAI-compatible Chat Completion APIs (streaming mode)
+
+    For reasoning models, chunks carrying `delta.reasoning_content` or `delta.reasoning` set
+    [`time_to_first_token`][llmeter.endpoints.base.InvocationResponse] and
+    [`reasoning_type`][llmeter.endpoints.base.InvocationResponse]; the first chunk with visible
+    `delta.content` sets `time_to_first_content_token`.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        endpoint_name: str = "openai",
+        api_key: str | None = None,
+        provider: str = "openai",
+        default_reasoning_visibility: ReasoningType | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+        base_url: str | httpx.URL | None = None,
+        websocket_base_url: str | httpx.URL | None = None,
+        timeout: float | httpx.Timeout | dict | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        default_headers: Mapping[str, str] | None = None,
+        default_query: Mapping[str, object] | None = None,
+        **kwargs: Any,
+    ):
+        """Initialize streaming Chat Completions endpoint.
+
+        Args:
+            model_id: ID of the model to use.
+            endpoint_name: Name of the endpoint (default: "openai").
+            api_key: API key (optional, uses OPENAI_API_KEY env var if not provided).
+            provider: Provider name (default: "openai").
+            default_reasoning_visibility: What to record as
+                [`reasoning_type`][llmeter.endpoints.base.InvocationResponse] when reasoning
+                content is present. The Chat Completions schema carries no indication of whether
+                reasoning is verbatim or summarized, so it cannot be detected from the response.
+                Defaults to a guess from `model_id` via
+                [`infer_reasoning_visibility_from_model_id`][llmeter.endpoints.base.infer_reasoning_visibility_from_model_id]
+                - `"summary"` for Anthropic models (reached through a gateway), `"verbatim"`
+                otherwise. Pass `"unknown"` to decline guessing.
+            organization: OpenAI organization ID. Defaults to None.
+            project: OpenAI project ID. Defaults to None.
+            base_url: Override the default base URL for the API.
+            websocket_base_url: Override the default base URL for websocket connections.
+            timeout: Request timeout in seconds, or an httpx.Timeout for granular control.
+            max_retries: Maximum number of retries for failed requests.
+            default_headers: Additional headers to send with every request.
+            default_query: Additional query parameters to send with every request.
+            **kwargs: Additional arguments passed to the OpenAI client.
+        """
+        super().__init__(
+            model_id=model_id,
+            endpoint_name=endpoint_name,
+            api_key=api_key,
+            provider=provider,
+            organization=organization,
+            project=project,
+            base_url=base_url,
+            websocket_base_url=websocket_base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            default_headers=default_headers,
+            default_query=default_query,
+            default_reasoning_visibility=default_reasoning_visibility,
+            **kwargs,
+        )
 
     @OpenAIEndpoint.llmeter_invoke
     def invoke(self, payload: CompletionCreateParamsStreaming):
@@ -383,6 +479,7 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint[Iterable[ChatCompletionChunk
         `delta.content` sets `time_to_first_content_token`.
         """
         got_chunk_id = False
+        saw_reasoning = False
         for chunk in raw_response:
             now = time.perf_counter()
 
@@ -403,11 +500,10 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint[Iterable[ChatCompletionChunk
                     else:
                         response.response_text += content
                     response.time_to_last_token = now - start_t
-                elif (
-                    response.time_to_first_token is None
-                    and delta_has_reasoning_content(delta)
-                ):
-                    response.time_to_first_token = now - start_t
+                elif delta_has_reasoning_content(delta):
+                    saw_reasoning = True
+                    if response.time_to_first_token is None:
+                        response.time_to_first_token = now - start_t
 
             if chunk.usage is not None:
                 response.num_tokens_input = chunk.usage.prompt_tokens
@@ -422,3 +518,6 @@ class OpenAICompletionStreamEndpoint(OpenAIEndpoint[Iterable[ChatCompletionChunk
                         "reasoning_tokens",
                         None,
                     )
+
+        if saw_reasoning:
+            response.reasoning_type = self.default_reasoning_visibility or "unknown"

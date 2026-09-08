@@ -14,7 +14,7 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.completion_usage import CompletionUsage
 
-from llmeter.endpoints.base import InvocationResponse
+from llmeter.endpoints.base import Endpoint, InvocationResponse
 from llmeter.endpoints.openai import (
     OpenAICompletionEndpoint,
     OpenAICompletionStreamEndpoint,
@@ -278,6 +278,9 @@ class TestOpenAICompletionEndpoint:
         assert response.response_text == "Hello! How can I help you today?"
         assert response.num_tokens_input == 10
         assert response.num_tokens_output == 8
+        # Non-streaming: neither first-token metric is measurable
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
 
     def test_process_raw_response_no_usage(self, endpoint):
         """Test process_raw_response with no usage information."""
@@ -1043,7 +1046,7 @@ def _content_chunk(text, chunk_id="chatcmpl-r1"):
     )
 
 
-class TestOpenAICompletionStreamReasoning:
+class TestOpenAICompletionStreamFirstTokenMetrics:
     @pytest.fixture
     def endpoint(self):
         return OpenAICompletionStreamEndpoint(model_id="gpt-oss-120b", api_key="test")
@@ -1118,3 +1121,135 @@ class TestOpenAICompletionStreamReasoning:
 
         assert response.time_to_first_token == pytest.approx(0.6)
         assert response.time_to_first_content_token == pytest.approx(0.6)
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning_type resolution, across both Chat Completions endpoints
+# ---------------------------------------------------------------------------
+
+
+def _sync_completion(**message_attrs):
+    """A non-streaming Chat Completion whose message may carry reasoning fields."""
+    message = SimpleNamespace(content="Answer", **message_attrs)
+    return SimpleNamespace(
+        id="chatcmpl-1", choices=[SimpleNamespace(message=message)], usage=None
+    )
+
+
+def _stream_for_shape(shape: str):
+    chunks = {
+        "reasoning_content": [_reasoning_chunk(field="reasoning_content")],
+        "reasoning": [_reasoning_chunk(field="reasoning")],
+        "none": [],
+    }[shape]
+    return iter([*chunks, _content_chunk("Answer")])
+
+
+def _sync_for_shape(shape: str):
+    attrs = {
+        "reasoning_content": {"reasoning_content": "thinking"},
+        "reasoning": {"reasoning": "thinking"},
+        "none": {},
+    }[shape]
+    return _sync_completion(**attrs)
+
+
+#: Parametrising over the transport is the point: the same provider fields appear in streamed deltas
+#: and in a non-streaming message, so both must resolve equivalent content identically.
+_MODES = {
+    "streaming": (OpenAICompletionStreamEndpoint, _stream_for_shape),
+    "non-streaming": (OpenAICompletionEndpoint, _sync_for_shape),
+}
+
+_SHAPES = ("reasoning_content", "reasoning", "none")
+
+
+def _resolve(mode: str, shape: str, model_id="gpt-oss-120b", declared=None):
+    endpoint_cls, build = _MODES[mode]
+    endpoint = endpoint_cls(
+        model_id=model_id, api_key="k", default_reasoning_visibility=declared
+    )
+    response = InvocationResponse(response_text=None)
+    endpoint.process_raw_response(build(shape), time.perf_counter(), response)
+    return response
+
+
+class TestOpenAICompletionReasoningTypeResolution:
+    """Chat Completions carries no fidelity marker, so this is inferred or declared."""
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "shape,expected",
+        [
+            ("reasoning_content", "verbatim"),
+            ("reasoning", "verbatim"),
+            # No reasoning at all must stay unset, *not* take the endpoint's default
+            ("none", None),
+        ],
+    )
+    def test_resolution_by_content_shape(self, mode, shape, expected):
+        assert _resolve(mode, shape).reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "model_id,expected",
+        [
+            ("gpt-oss-120b", "verbatim"),
+            ("deepseek-reasoner", "verbatim"),
+            ("anthropic.claude-opus-4-6", "summary"),
+            ("bedrock/anthropic.claude-sonnet-4-6", "summary"),
+        ],
+    )
+    def test_inferred_from_model_id(self, mode, model_id, expected):
+        response = _resolve(mode, "reasoning_content", model_id=model_id)
+        assert response.reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "declared,expected",
+        [("verbatim", "verbatim"), ("summary", "summary"), ("unknown", "unknown")],
+    )
+    def test_declared_visibility_overrides_inference(self, mode, declared, expected):
+        response = _resolve(
+            mode,
+            "reasoning_content",
+            model_id="anthropic.claude-opus-4-6",
+            declared=declared,
+        )
+        assert response.reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize("shape", _SHAPES)
+    def test_reasoning_never_leaks_into_response_text(self, mode, shape):
+        assert _resolve(mode, shape).response_text == "Answer"
+
+    def test_non_streaming_records_no_first_token_metrics(self):
+        response = _resolve("non-streaming", "reasoning_content")
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
+
+    def test_reasoning_after_first_content_is_still_detected(self):
+        """Detection must not be gated on TTFT being unset, or late reasoning would be missed."""
+        endpoint = OpenAICompletionStreamEndpoint(model_id="gpt-oss-120b", api_key="k")
+        response = InvocationResponse(response_text=None)
+        endpoint.process_raw_response(
+            iter([_content_chunk("Ans"), _reasoning_chunk(), _content_chunk("wer")]),
+            time.perf_counter(),
+            response,
+        )
+        assert response.reasoning_type == "verbatim"
+
+    def test_declared_arg_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original = OpenAICompletionStreamEndpoint(
+                model_id="gpt-oss-120b",
+                api_key="k",
+                default_reasoning_visibility="summary",
+            )
+            path = Path(tmpdir) / "endpoint.json"
+            original.save_to_file(path)
+            loaded = Endpoint.load_from_file(path)
+
+        assert isinstance(loaded, OpenAICompletionStreamEndpoint)
+        assert loaded.model_id == "gpt-oss-120b", "other config must survive too"
+        assert loaded.default_reasoning_visibility == "summary"

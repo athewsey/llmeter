@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from uuid import uuid4
 
 from upath import UPath as Path
@@ -34,6 +34,33 @@ from ..utils import ensure_path
 
 logger = logging.getLogger(__name__)
 
+ReasoningType = Literal["verbatim", "summary", "redacted", "unknown"]
+"""
+How internal reasoning was disclosed in a model's response, when the model reasoned at all.
+
+What matters for timing (and `time_per_output_token` calculation) is whether the reasoning reached us
+*as it was generated*, or after the fact, or not at all.
+
+* `"verbatim"`: The reasoning tokens themselves were streamed as plain text, so their decode time
+    is inside the window between `time_to_first_token` and `time_to_last_token`.
+* `"summary"`: Only a *summary* of the reasoning was streamed. A summary is shorter than the
+    reasoning it describes and cannot be produced until some reasoning already exists, so at least
+    part of the reasoning generation falls outside the measured TTFT-TTLT window.
+* `"redacted"`: The reasoning content was withheld. This covers both content that is encrypted
+    but still delivered (Bedrock Converse `reasoningContent.redactedContent` deltas, Anthropic
+    `redacted_thinking` blocks) and content that is not delivered at all until it is complete
+    (Anthropic `thinking.display: "omitted"`, where a trailing `signature_delta` is the only
+    signal). Whether a given API delivers redacted reasoning as it is generated is not documented
+    and appears to vary, so LLMeter does not distinguish the two and conservatively refuses to
+    use either for TPOT calculation.
+* `"unknown"`: Reasoning demonstrably happened, but the endpoint could not establish how it was
+    disclosed. Distinct from `None`, which means no reasoning was observed at all.
+
+Only `"verbatim"` - and `None`, where there is no reasoning to account for - permit calculating the
+`time_per_output_token` from the whole measured TTFT-TTLT window and full output token count. See
+[`_Run._compute_time_per_output_token`][llmeter.runner._Run._compute_time_per_output_token].
+"""
+
 
 # @dataclass(slots=True)
 @dataclass
@@ -46,12 +73,14 @@ class InvocationResponse:
         id (str): A unique identifier for the invocation.
         time_to_last_token (float): The time taken to generate the response in seconds.
         time_to_first_token: Seconds until the first output token of **any** kind arrived,
-            including internal reasoning/thinking tokens. This measures when the model started
-            generating, so it isolates prefill and prompt ingestion network latency from
-            generation/decode. `None` for non-streaming endpoints, **and** for streaming endpoints
-            where the first token is not directly observable (for example newer Anthropic models
-            with summarized thinking - as discussed in
-            [`AnthropicMessagesStream`][llmeter.endpoints.anthropic_messages.AnthropicMessagesStream]).
+            including internal reasoning/thinking tokens. `None` for non-streaming endpoints.
+
+            Note this is the first output *received*, which is not always the first token
+            *generated*: where a model withholds its reasoning, the earliest observable signal can
+            arrive after reasoning finished.
+            [`reasoning_type`][llmeter.endpoints.base.ReasoningType] records when that applies, and
+            is what makes such values recognisable as not comparable with a model that streams its
+            reasoning.
         time_to_first_content_token: Seconds until the first **visible** (non-reasoning) output
             token arrived. In applications where users see streaming output but internal "thinking"
             is hidden, this will correspond closely to user-perceived latency. Equal to
@@ -66,6 +95,11 @@ class InvocationResponse:
             `output_tokens_details.thinking_tokens`. `None` when the provider does not provide a
             separate count for this.
         input_prompt (str): The input prompt used in the invocation.
+        reasoning_type: How the model's internal reasoning was disclosed, or `None` if the model
+            does not appear to have reasoned at all. One of `"verbatim"`, `"summary"`,
+            `"redacted"` or `"unknown"` - see
+            [`ReasoningType`][llmeter.endpoints.base.ReasoningType]. This governs whether
+            `time_per_output_token` can be derived from the full output token count.
         time_per_output_token (float): The average time taken to generate each token in the
             response, **excluding** initial prompt processing/prefill. Computed by the `Runner`
             from whichever pairing of first-token metric and token count is internally consistent;
@@ -91,6 +125,7 @@ class InvocationResponse:
     num_tokens_output: int | None = None
     num_tokens_input_cached: int | None = None
     num_tokens_output_reasoning: int | None = None
+    reasoning_type: ReasoningType | None = None
     time_per_output_token: float | None = None
     error: str | None = None
     retries: int | None = None
@@ -290,6 +325,37 @@ def delta_has_reasoning_content(delta: Any) -> bool:
     if isinstance(blocks, (list, tuple)) and blocks:
         return True
     return False
+
+
+def infer_reasoning_visibility_from_model_id(model_id: str) -> ReasoningType | None:
+    """Guess how a model discloses its reasoning, from provider naming in its ID.
+
+    Several streaming schemas look identical whether the model streams its reasoning verbatim or
+    only a summary of it, in which cases this cannot be detected from the responses alone. This
+    helper attempts to infer a default from a model identifier - since usually reasoning behaviour
+    is by provider, and model IDs are usually namespaced by provider such as -
+    `anthropic.claude-opus-4-7`, `us.anthropic.claude-...`, `bedrock/anthropic.claude-...`,
+    `openai.gpt-oss-120b-1:0`.
+
+    * **Anthropic models** return *summarized* thinking on Claude 4 and later, so `"summary"` is
+      assumed. This is wrong for Claude 3.7 Sonnet, which returns its full thinking output; declare
+      `default_reasoning_visibility="verbatim"` explicitly for that model (or older ones).
+    * **Everything else** (`gpt-oss`, Qwen, DeepSeek, ...) streams the reasoning tokens themselves,
+      so `"verbatim"` is assumed.
+
+    Matching is on whole `/`- and `.`-delimited segments, so a lookalike such as
+    `acme.anthropic-compatible-v1` is not treated as Anthropic.
+
+    Args:
+        model_id: The model identifier, with or without provider/region prefixes.
+
+    Returns:
+        The assumed disclosure level, or `None` if `model_id` is not a string.
+    """
+    if not isinstance(model_id, str):
+        return None
+    segments = model_id.replace("/", ".").split(".")
+    return "summary" if "anthropic" in segments else "verbatim"
 
 
 TRawResponse = TypeVar("TRawResponse", bound=Any)

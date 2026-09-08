@@ -150,6 +150,25 @@ def bedrock_openai_multimodal_test_model():
 
 
 @pytest.fixture(scope="session")
+def bedrock_anthropic_converse_test_model():
+    """
+    Get an Anthropic model ID for *Converse* API reasoning tests.
+
+    Distinct from `bedrock_anthropic_mantle_test_model`: that one targets the Bedrock Mantle
+    Anthropic Messages endpoint, whereas this is invoked through the standard Converse API, where
+    thinking surfaces as `reasoningContent` deltas instead.
+
+    Can be overridden via the `BEDROCK_ANTHROPIC_CONVERSE_TEST_MODEL` environment variable.
+
+    Returns:
+        str: Anthropic model ID for Converse reasoning testing.
+    """
+    return os.environ.get(
+        "BEDROCK_ANTHROPIC_CONVERSE_TEST_MODEL", "global.anthropic.claude-opus-4-7"
+    )
+
+
+@pytest.fixture(scope="session")
 def bedrock_anthropic_mantle_test_model():
     """
     Get test model ID for Anthropic Messages API tests via Bedrock Mantle.

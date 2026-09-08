@@ -337,10 +337,15 @@ class _Run(_RunConfig):
 
         1. **All tokens.** `(time_to_last_token - time_to_first_token) / (num_tokens_output - 1)`.
            `time_to_first_token` marks the first token of any kind and `num_tokens_output` counts
-           every generated token (reasoning included), so the two agree.
-        2. **Content tokens only.** Used when `time_to_first_token` is unavailable (due to
-           encrypted or summarised reasoning for example) but the `time_to_first_content_token` was
-           available and the provider reports how many output tokens were reasoning, letting us
+           every generated token (reasoning included), so the two agree - *provided* the reasoning
+           reached us as it was generated. Used when
+           [`reasoning_type`][llmeter.endpoints.base.InvocationResponse] is `None` (no reasoning) or
+           `"verbatim"` (the reasoning itself was streamed as text).
+        2. **Content tokens only.** Used when `time_to_first_token` is unavailable, or when
+           `reasoning_type` is `"summary"`, `"redacted"` or `"unknown"` - in those cases some
+           reasoning decode may have happened before anything reached us, so the window understates
+           it.
+           Requires the provider to report how many output tokens were reasoning, letting us
            subtract them:
            `(time_to_last_token - time_to_first_content_token) / (num_visible_tokens - 1)`.
 
@@ -356,7 +361,14 @@ class _Run(_RunConfig):
         if not response.time_to_last_token or not response.num_tokens_output:
             return  # Required data points not available
 
-        if response.time_to_first_token:
+        # The full-output pairing is only valid when every counted output token reached us *as it
+        # was generated*, so that the measured window contains its decode time. Only plainly
+        # streamed reasoning ("verbatim") is known to satisfy that. Summarized reasoning provably
+        # does not, and for redacted reasoning it is undocumented and appears to vary by API - so
+        # those, and anything unclassified, fall through to the answer-only pairing.
+        reasoning_accounted_for = response.reasoning_type in (None, "verbatim")
+
+        if response.time_to_first_token and reasoning_accounted_for:
             start = response.time_to_first_token
             n_tokens = response.num_tokens_output
         elif (

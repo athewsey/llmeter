@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from upath import UPath as Path
 
-import llmeter.endpoints
 from llmeter.endpoints.base import Endpoint, InvocationResponse
 from llmeter.runner import Runner, _Run, _RunConfig
 from llmeter.tokenizers import DummyTokenizer
@@ -1218,128 +1217,203 @@ def test_prepare_run_duration_and_n_requests_conflict(runner: Runner):
 
 
 class TestComputeTimePerOutputToken:
-    """TPOT must pair an elapsed time with a token count covering the *same* tokens."""
+    """TPOT selection logic: which time/token pairing is used, and when neither is valid.
+
+    Four independent inputs decide the outcome, so the cases are organised by factor rather than by
+    scenario:
+
+    1. `reasoning_type` - whether the reasoning was accounted for in the measured window
+    2. `time_to_first_token` - present or not
+    3. `time_to_first_content_token` - present or not
+    4. `num_tokens_output_reasoning` - reported or not, which is what makes the answer-only
+       pairing computable
+
+    Provider-specific narratives (e.g. Anthropic thinking modes) live with their endpoint tests;
+    this suite is only about the arithmetic selection.
+    """
+
+    #: Baseline where the two pairings give *different* answers, so which one ran is observable:
+    #:   whole-output  = (5.0 - 1.0) / (11 - 1)       = 0.4
+    #:   answer-only   = (5.0 - 3.0) / ((11 - 6) - 1) = 0.5
+    BASE = {
+        "response_text": "x",
+        "time_to_first_token": 1.0,
+        "time_to_first_content_token": 3.0,
+        "time_to_last_token": 5.0,
+        "num_tokens_output": 11,
+        "num_tokens_output_reasoning": 6,
+    }
+    WHOLE_OUTPUT = pytest.approx(0.4)
+    ANSWER_ONLY = pytest.approx(0.5)
+
+    @classmethod
+    def _response(cls, **overrides) -> InvocationResponse:
+        return InvocationResponse(**{**cls.BASE, **overrides})
+
+    # -- Factor 1: reasoning_type selects the pairing ---------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_all_token_pairing(self):
-        """With TTFT available, decode time and total token count are used."""
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=1.0,
-            time_to_first_content_token=3.0,
-            time_to_last_token=5.0,
-            num_tokens_output=11,
-        )
+    @pytest.mark.parametrize(
+        "reasoning_type,expected",
+        [
+            # Nothing to account for, or the reasoning itself was streamed: the measured window
+            # contains all the decode that `num_tokens_output` counts.
+            (None, WHOLE_OUTPUT),
+            ("verbatim", WHOLE_OUTPUT),
+            # Reasoning reached us late, partially, or unclassifiably, so some counted tokens were
+            # generated before the window began.
+            ("summary", ANSWER_ONLY),
+            ("redacted", ANSWER_ONLY),
+            ("unknown", ANSWER_ONLY),
+        ],
+    )
+    async def test_pairing_selected_by_reasoning_type(self, reasoning_type, expected):
+        response = self._response(reasoning_type=reasoning_type)
 
         await _Run._compute_time_per_output_token(response)
 
-        # (5.0 - 1.0) / (11 - 1)
-        assert response.time_per_output_token == pytest.approx(0.4)
+        assert response.time_per_output_token == expected
 
     @pytest.mark.asyncio
-    async def test_all_token_pairing_ignores_reasoning_split(self):
-        """The all-token pairing is valid whether or not a reasoning count is reported."""
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=1.0,
-            time_to_first_content_token=3.0,
-            time_to_last_token=5.0,
-            num_tokens_output=11,
-            num_tokens_output_reasoning=6,
-        )
+    async def test_unknown_is_not_treated_as_none(self):
+        """The two must not collapse: `None` means no reasoning, `"unknown"` means unclassified.
 
-        await _Run._compute_time_per_output_token(response)
-        # *NOT* 0.5 which would indicate just the content tokens being used:
-        assert response.time_per_output_token == pytest.approx(0.4)
+        Conflating them would apply the whole-output pairing to a response it is not valid for.
+        """
+        unknown = self._response(reasoning_type="unknown")
+        absent = self._response(reasoning_type=None)
 
-    @pytest.mark.asyncio
-    async def test_visible_token_fallback(self):
-        """Without TTFT, a reported reasoning count enables the visible-only pairing."""
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=None,
-            time_to_first_content_token=3.0,
-            time_to_last_token=5.0,
-            num_tokens_output=11,
-            num_tokens_output_reasoning=6,
-        )
+        await _Run._compute_time_per_output_token(unknown)
+        await _Run._compute_time_per_output_token(absent)
 
-        await _Run._compute_time_per_output_token(response)
+        assert unknown.time_per_output_token != absent.time_per_output_token
 
-        # (5.0 - 3.0) / ((11 - 6) - 1)
-        assert response.time_per_output_token == pytest.approx(0.5)
+    # -- Factor 2/3/4: which pairings the available data points permit ----------------------------
 
     @pytest.mark.asyncio
-    async def test_no_consistent_pairing_yields_none(self):
-        """The Anthropic `display: "omitted"` case: no TTFT and no reasoning breakdown."""
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=None,
-            time_to_first_content_token=3.0,
-            time_to_last_token=5.0,
-            num_tokens_output=11,
-            num_tokens_output_reasoning=None,
-        )
-
-        await _Run._compute_time_per_output_token(response)
-
-        # Mixing the post-reasoning window with a reasoning-inclusive token count would
-        # understate TPOT (here 0.2 vs a true visible-only value), so report nothing.
-        assert response.time_per_output_token is None
-
-    @pytest.mark.asyncio
-    async def test_single_visible_token_yields_none(self):
-        """One visible token gives no decode interval to average over."""
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=None,
-            time_to_first_content_token=3.0,
-            time_to_last_token=5.0,
-            num_tokens_output=11,
-            num_tokens_output_reasoning=10,
-        )
-
-        await _Run._compute_time_per_output_token(response)
-
-        assert response.time_per_output_token is None
-
-    @pytest.mark.asyncio
-    async def test_single_output_token_yields_none(self):
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=1.0,
-            time_to_last_token=5.0,
-            num_tokens_output=1,
-        )
+    @pytest.mark.parametrize(
+        "reasoning_type,overrides,expected,why",
+        [
+            # Whole-output needs TTFT *and* accounted-for reasoning. Without TTFT it falls through
+            # to the answer-only pairing even when reasoning was accounted for.
+            (None, {"time_to_first_token": None}, ANSWER_ONLY, "no TTFT falls back"),
+            (
+                "verbatim",
+                {"time_to_first_token": None},
+                ANSWER_ONLY,
+                "no TTFT falls back",
+            ),
+            # Answer-only needs the content TTFT *and* a reasoning-token count. Missing either
+            # leaves nothing internally consistent.
+            (
+                "summary",
+                {"num_tokens_output_reasoning": None},
+                None,
+                "withheld reasoning, no breakdown to subtract",
+            ),
+            (
+                "summary",
+                {"time_to_first_content_token": None},
+                None,
+                "withheld reasoning, no content TTFT",
+            ),
+            (
+                None,
+                {"time_to_first_token": None, "num_tokens_output_reasoning": None},
+                None,
+                "neither pairing available",
+            ),
+            (
+                None,
+                {"time_to_first_token": None, "time_to_first_content_token": None},
+                None,
+                "neither pairing available",
+            ),
+            # A reported count of *zero* is still a report: the provider confirmed there were no
+            # reasoning tokens, so the answer-only pairing is computable (and equals the whole
+            # output). Distinguishes `is not None` from a truthiness check.
+            (
+                "summary",
+                {"num_tokens_output_reasoning": 0},
+                pytest.approx((5.0 - 3.0) / (11 - 0 - 1)),
+                "zero is a reported breakdown, not a missing one",
+            ),
+        ],
+    )
+    async def test_pairing_selected_by_available_data(
+        self, reasoning_type, overrides, expected, why
+    ):
+        response = self._response(reasoning_type=reasoning_type, **overrides)
 
         await _Run._compute_time_per_output_token(response)
 
-        assert response.time_per_output_token is None
+        assert response.time_per_output_token == expected, why
+
+    # -- Guards: inputs that must short-circuit before any pairing is attempted -------------------
 
     @pytest.mark.asyncio
-    async def test_existing_value_preserved(self):
-        """An endpoint that reports TPOT directly must not be overwritten."""
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=1.0,
-            time_to_last_token=5.0,
-            num_tokens_output=11,
-            time_per_output_token=0.123,
-        )
+    async def test_existing_value_is_never_overwritten(self):
+        """An endpoint that reports TPOT itself must win over any derivation."""
+        response = self._response(time_per_output_token=0.123)
 
         await _Run._compute_time_per_output_token(response)
 
         assert response.time_per_output_token == 0.123
 
     @pytest.mark.asyncio
-    async def test_missing_timings_yield_none(self):
-        response = InvocationResponse(
-            response_text="x",
-            time_to_first_token=1.0,
-            time_to_last_token=None,
-            num_tokens_output=11,
-        )
+    @pytest.mark.parametrize(
+        "overrides,why",
+        [
+            ({"time_to_last_token": None}, "no end timestamp"),
+            ({"time_to_last_token": 0.0}, "zero end timestamp is not usable"),
+            ({"num_tokens_output": None}, "no output token count"),
+            ({"num_tokens_output": 0}, "zero output tokens"),
+        ],
+    )
+    async def test_missing_required_inputs_yield_none(self, overrides, why):
+        response = self._response(**overrides)
 
         await _Run._compute_time_per_output_token(response)
 
-        assert response.time_per_output_token is None
+        assert response.time_per_output_token is None, why
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides,why",
+        [
+            # Whole-output pairing: a single output token gives no decode interval to average
+            ({"num_tokens_output": 1, "reasoning_type": None}, "1 output token"),
+            # Answer-only pairing: same, once reasoning tokens are subtracted
+            (
+                {
+                    "num_tokens_output": 11,
+                    "num_tokens_output_reasoning": 10,
+                    "reasoning_type": "summary",
+                },
+                "1 visible token",
+            ),
+            (
+                {
+                    "num_tokens_output": 11,
+                    "num_tokens_output_reasoning": 11,
+                    "reasoning_type": "summary",
+                },
+                "0 visible tokens",
+            ),
+            # Inconsistent provider data must not produce a negative-denominator result
+            (
+                {
+                    "num_tokens_output": 11,
+                    "num_tokens_output_reasoning": 20,
+                    "reasoning_type": "summary",
+                },
+                "more reasoning tokens than total output",
+            ),
+        ],
+    )
+    async def test_too_few_tokens_to_average_yields_none(self, overrides, why):
+        response = self._response(**overrides)
+
+        await _Run._compute_time_per_output_token(response)
+
+        assert response.time_per_output_token is None, why

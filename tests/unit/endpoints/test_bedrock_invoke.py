@@ -131,6 +131,9 @@ class TestBedrockInvoke:
         assert result.num_tokens_input == 10
         assert result.num_tokens_output == 20
         assert result.retries == 1
+        # Non-streaming: neither first-token metric is measurable
+        assert result.time_to_first_token is None
+        assert result.time_to_first_content_token is None
 
     def test__parse_response_no_matching_jmespaths(self):
         """
@@ -460,6 +463,7 @@ class TestBedrockInvokeStream:
         assert result.num_tokens_output == 7
 
         assert result.time_to_first_token is None
+        assert result.time_to_first_content_token is None
         assert result.time_to_last_token is None
 
     def test__parse_response_stream_known_error(self):
@@ -571,6 +575,7 @@ class TestBedrockInvokeStream:
         assert isinstance(result, InvocationResponse)
         assert result.response_text is None
         assert result.time_to_first_token is None
+        assert result.time_to_first_content_token is None
         assert result.time_to_last_token is None
 
     def test_invoke_client_error(self):
@@ -778,7 +783,7 @@ def _invoke_stream(events: list[dict]) -> dict:
     return {"body": events, "ResponseMetadata": {"RetryAttempts": 0}}
 
 
-class TestBedrockInvokeStreamReasoning:
+class TestBedrockInvokeStreamFirstTokenMetrics:
     @patch("time.perf_counter")
     def test_reasoning_chunk_sets_ttft_only(self, mock_perf_counter):
         """A `reasoning_content`-only chunk sets TTFT but not the content TTFT."""
@@ -851,3 +856,86 @@ class TestBedrockInvokeStreamReasoning:
 
         assert result.time_to_first_token == pytest.approx(0.6)
         assert result.time_to_first_content_token == pytest.approx(0.6)
+
+
+class TestBedrockInvokeStreamReasoningTypeResolution:
+    @pytest.mark.parametrize(
+        "model_id,expected",
+        [
+            ("anthropic.claude-opus-4-6", "summary"),
+            ("us.anthropic.claude-sonnet-4-6", "summary"),
+            ("openai.gpt-oss-120b-1:0", "verbatim"),
+        ],
+    )
+    def test_inferred_from_model_id(self, model_id, expected):
+        endpoint = BedrockInvokeStream(model_id=model_id)
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream(
+                [
+                    _invoke_chunk(reasoning_content="thinking..."),
+                    _invoke_chunk(content="Answer"),
+                ]
+            ),
+            time.perf_counter(),
+            result,
+        )
+        assert result.reasoning_type == expected
+
+    def test_explicit_declaration_wins(self):
+        endpoint = BedrockInvokeStream(
+            model_id="anthropic.claude-3-7-sonnet",
+            default_reasoning_visibility="verbatim",
+        )
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream(
+                [
+                    _invoke_chunk(reasoning_content="thinking..."),
+                    _invoke_chunk(content="Answer"),
+                ]
+            ),
+            time.perf_counter(),
+            result,
+        )
+        assert result.reasoning_type == "verbatim"
+
+    def test_type_left_unset_when_no_reasoning(self):
+        endpoint = BedrockInvokeStream(model_id="anthropic.claude-opus-4-6")
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream([_invoke_chunk(content="Answer")]),
+            time.perf_counter(),
+            result,
+        )
+        assert result.reasoning_type is None
+
+    @pytest.mark.asyncio
+    async def test_anthropic_model_yields_no_tpot(self):
+        """Documents the consequence flagged for this endpoint.
+
+        InvokeModel reports no reasoning-token breakdown, so an inferred `"summary"` rules out the
+        full-output pairing without enabling the answer-only one - leaving TPOT unset rather than
+        understated.
+        """
+        from llmeter.runner import _Run
+
+        endpoint = BedrockInvokeStream(model_id="anthropic.claude-opus-4-6")
+        result = InvocationResponse(id=None, response_text=None)
+        endpoint.process_raw_response(
+            _invoke_stream(
+                [
+                    _invoke_chunk(reasoning_content="thinking..."),
+                    _invoke_chunk(content="Answer"),
+                ]
+            ),
+            time.perf_counter(),
+            result,
+        )
+        result.num_tokens_output = 50
+
+        await _Run._compute_time_per_output_token(result)
+
+        assert result.reasoning_type == "summary"
+        assert result.num_tokens_output_reasoning is None
+        assert result.time_per_output_token is None

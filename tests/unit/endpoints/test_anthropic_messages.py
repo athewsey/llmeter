@@ -321,6 +321,9 @@ class TestAnthropicMessages:
         assert response.num_tokens_input == 10
         assert response.num_tokens_output == 5
         assert response.time_to_last_token is not None
+        # Non-streaming: neither first-token metric is measurable
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
 
     def test_process_raw_response_with_cache(self, mock_client):
         endpoint = AnthropicMessages(model_id="test-model")
@@ -452,6 +455,7 @@ class TestAnthropicMessagesStream:
 
         assert response.response_text is None
         assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
 
     def test_process_raw_response_timing(self, mock_client):
         """Verify TTFT is captured on the first text delta."""
@@ -597,55 +601,6 @@ class TestAnthropicMessagesStream:
         assert response.time_to_first_token is not None
         assert response.time_to_first_content_token is None
         assert response.response_text is None
-
-    def test_display_omitted_reports_no_ttft(self, mock_client):
-        """With display=omitted the first token is unobservable, so TTFT must be None.
-
-        Only a signature_delta precedes the text, and it is emitted *after* thinking finishes.
-        Reporting it (or the text delta) as TTFT would be wrong, so we report nothing.
-        """
-        endpoint = AnthropicMessagesStream(model_id="test-model")
-
-        events = [
-            _message_start_event(),
-            _delta_event("signature_delta", signature="EosnCkYICxIMMb3LzNrMu..."),
-            _delta_event("text_delta", text="Answer"),
-        ]
-
-        response = _make_draft_response()
-        with patch("time.perf_counter") as clock:
-            clock.side_effect = [100.1, 100.6, 100.8]
-            endpoint.process_raw_response(iter(events), 100.0, response)
-
-        assert response.time_to_first_token is None
-        assert response.time_to_first_content_token == pytest.approx(0.8)
-        assert response.response_text == "Answer"
-        # The signature time is preserved, but only as an annotation
-        assert response.annotations[
-            "anthropic_time_to_thinking_signature"
-        ] == pytest.approx(0.6)
-
-    def test_display_summarized_keeps_ttft_despite_signature(self, mock_client):
-        """A signature_delta must not suppress TTFT when thinking deltas were also streamed."""
-        endpoint = AnthropicMessagesStream(model_id="test-model")
-
-        events = [
-            _message_start_event(),
-            _delta_event("thinking_delta", thinking="Reasoning..."),
-            _delta_event("signature_delta", signature="EosnCkYICxIMMb3LzNrMu..."),
-            _delta_event("text_delta", text="Answer"),
-        ]
-
-        response = _make_draft_response()
-        with patch("time.perf_counter") as clock:
-            clock.side_effect = [100.1, 100.3, 100.6, 100.8]
-            endpoint.process_raw_response(iter(events), 100.0, response)
-
-        assert response.time_to_first_token == pytest.approx(0.3)
-        assert response.time_to_first_content_token == pytest.approx(0.8)
-        assert response.annotations[
-            "anthropic_time_to_thinking_signature"
-        ] == pytest.approx(0.6)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,14 +970,18 @@ class TestThinkingTokenAccounting:
 # ---------------------------------------------------------------------------
 
 
-class TestOmittedThinkingTpotRecovery:
-    """`display: "omitted"` loses TTFT but must still yield TPOT.
+class TestRedactedThinkingTpotRecovery:
+    """`display: "omitted"` still yields a correct TPOT, via `reasoning_type`.
 
     Unlike the arithmetic-only cases in
     ``tests/unit/test_runner.py::TestComputeTimePerOutputToken``, this drives the real endpoint
-    parser so the whole chain is covered: the stream shape produces `time_to_first_token=None`,
-    `usage.output_tokens_details.thinking_tokens` populates `num_tokens_output_reasoning`, and the
-    Runner then derives TPOT from those. A regression in any one of the three breaks this.
+    parser so the whole chain is covered: the stream shape produces
+    ``reasoning_type="redacted"``, ``usage.output_tokens_details.thinking_tokens`` populates
+    ``num_tokens_output_reasoning``, and the Runner then declines the full-output pairing and uses
+    the visible-token one. A regression in any one of the three breaks this.
+
+    Note TTFT *is* populated here (the signature time), so the Runner cannot rely on its absence --
+    it has to honour ``reasoning_type``.
     """
 
     @staticmethod
@@ -1050,7 +1009,9 @@ class TestOmittedThinkingTpotRecovery:
         ]
 
     @pytest.mark.asyncio
-    async def test_tpot_derived_without_ttft(self, mock_client):
+    async def test_tpot_uses_visible_pairing_despite_ttft_being_present(
+        self, mock_client
+    ):
         from llmeter.runner import _Run
 
         endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7")
@@ -1063,24 +1024,28 @@ class TestOmittedThinkingTpotRecovery:
                 iter(self._omitted_mode_events(thinking_tokens=60)), 100.0, response
             )
 
-        # Endpoint: TTFT unmeasurable, but the reasoning split is reported
-        assert response.time_to_first_token is None
+        # Endpoint: TTFT is the signature time, and the disclosure level is recorded
+        assert response.time_to_first_token == pytest.approx(0.5)
         assert response.time_to_first_content_token == pytest.approx(2.0)
         assert response.time_to_last_token == pytest.approx(5.0)
+        assert response.reasoning_type == "redacted"
         assert response.num_tokens_output == 100
         assert response.num_tokens_output_reasoning == 60
 
-        # Runner: TPOT recovered from the visible-token pairing
         await _Run._compute_time_per_output_token(response)
-        # (5.0 - 2.0) / ((100 - 60) - 1)
+
+        # Visible pairing: (5.0 - 2.0) / ((100 - 60) - 1)
         assert response.time_per_output_token == pytest.approx(3.0 / 39)
+        # NOT the full-output pairing, which TTFT alone would have selected
+        assert response.time_per_output_token != pytest.approx((5.0 - 0.5) / (100 - 1))
 
     @pytest.mark.asyncio
     async def test_tpot_unavailable_without_thinking_token_count(self, mock_client):
         """If a provider or gateway strips the breakdown, TPOT must be None rather than wrong.
 
         Pins the boundary of the recovery above: it depends entirely on `thinking_tokens` being
-        reported, since without it the visible-token count cannot be derived.
+        reported, since without it the visible-token count cannot be derived. TTFT is present, so
+        this also confirms the Runner does not silently fall back to the full-output pairing.
         """
         from llmeter.runner import _Run
 
@@ -1093,8 +1058,237 @@ class TestOmittedThinkingTpotRecovery:
                 iter(self._omitted_mode_events(thinking_tokens=None)), 100.0, response
             )
 
-        assert response.time_to_first_token is None
+        assert response.time_to_first_token == pytest.approx(0.5)
+        assert response.reasoning_type == "redacted"
         assert response.num_tokens_output_reasoning is None
 
         await _Run._compute_time_per_output_token(response)
         assert response.time_per_output_token is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning_type resolution, across both Anthropic endpoints
+# ---------------------------------------------------------------------------
+
+
+def _redacted_block_event(data="EmwKAhgBEgy3va3pzix"):
+    """A whole `redacted_thinking` block, which arrives via `content_block_start`.
+
+    The Messages API has no redacted-thinking *delta* type, so a connector inspecting only
+    `content_block_delta` cannot see these at all.
+    """
+    event = Mock()
+    event.type = "content_block_start"
+    event.content_block = Mock()
+    event.content_block.type = "redacted_thinking"
+    event.content_block.data = data
+    return event
+
+
+def _plain_block_start_event(block_type="text"):
+    event = Mock()
+    event.type = "content_block_start"
+    event.content_block = Mock()
+    event.content_block.type = block_type
+    return event
+
+
+def _stream_for_shape(shape: str):
+    events = {
+        "thinking": [_delta_event("thinking_delta", thinking="hmm")],
+        "redacted_block": [_redacted_block_event()],
+        "partial": [
+            _delta_event("thinking_delta", thinking="hmm"),
+            _redacted_block_event(),
+        ],
+        "none": [],
+    }[shape]
+    return iter(
+        [_message_start_event(), *events, _delta_event("text_delta", text="Answer")]
+    )
+
+
+def _sync_for_shape(shape: str):
+    specs = {
+        "thinking": ["thinking"],
+        "redacted_block": ["redacted_thinking"],
+        "partial": ["thinking", "redacted_thinking"],
+        "none": [],
+    }[shape]
+    blocks = []
+    for spec in [*specs, "text"]:
+        block = Mock()
+        block.type = spec
+        if spec == "text":
+            block.text = "Answer"
+        blocks.append(block)
+    msg = Mock()
+    msg.id = "msg_1"
+    msg.content = blocks
+    msg.usage = SimpleNamespace(
+        input_tokens=10, output_tokens=100, cache_read_input_tokens=None
+    )
+    return msg
+
+
+#: Parametrising over the transport is the point: streaming and non-streaming must resolve
+#: equivalent content to the same `reasoning_type`, and writing them as separate suites let that
+#: parity drift unchecked.
+_MODES = {
+    "streaming": (AnthropicMessagesStream, _stream_for_shape),
+    "non-streaming": (AnthropicMessages, _sync_for_shape),
+}
+
+_SHAPES = ("thinking", "redacted_block", "partial", "none")
+
+
+def _resolve(mode: str, shape: str, declared=None, model_id="claude-opus-4-7"):
+    endpoint_cls, build = _MODES[mode]
+    endpoint = endpoint_cls(model_id=model_id, default_reasoning_visibility=declared)
+    response = _make_draft_response()
+    endpoint.process_raw_response(build(shape), time.perf_counter(), response)
+    return response
+
+
+class TestReasoningTypeResolution:
+    """How `reasoning_type` is resolved, for both Anthropic endpoints.
+
+    Whether streamed thinking is raw or summarized is not observable - Claude 3.7 Sonnet returns the
+    full thinking output while Claude 4 returns a summary, with identical structure - so it falls
+    back to the declared visibility. Redaction *is* observable and takes precedence, including
+    alongside readable thinking, since partial redaction still means some reasoning was withheld.
+    """
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "shape,expected",
+        [
+            ("thinking", "summary"),
+            ("redacted_block", "redacted"),
+            ("partial", "redacted"),
+            # No reasoning at all must stay unset, *not* take the endpoint's default
+            ("none", None),
+        ],
+    )
+    def test_resolution_by_content_shape(self, mock_client, mode, shape, expected):
+        assert _resolve(mode, shape).reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "declared,expected",
+        [
+            ("verbatim", "verbatim"),
+            ("summary", "summary"),
+            # `None` means "use this endpoint's default", consistently with the endpoints that
+            # infer from the model ID -- it is *not* a way to decline guessing.
+            (None, "summary"),
+            # Declining is explicit, and must still record that reasoning happened.
+            ("unknown", "unknown"),
+        ],
+    )
+    def test_declared_visibility_for_readable_thinking(
+        self, mock_client, mode, declared, expected
+    ):
+        assert _resolve(mode, "thinking", declared=declared).reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_observable_redaction_beats_declared_visibility(self, mock_client, mode):
+        response = _resolve(mode, "redacted_block", declared="verbatim")
+        assert response.reasoning_type == "redacted"
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize("shape", _SHAPES)
+    def test_reasoning_never_leaks_into_response_text(self, mock_client, mode, shape):
+        assert _resolve(mode, shape).response_text == "Answer"
+
+    def test_non_streaming_records_no_first_token_metrics(self, mock_client):
+        response = _resolve("non-streaming", "thinking")
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
+
+
+class TestStreamingOnlyReasoningSignals:
+    """Signals that exist only in the streamed transport."""
+
+    def test_signature_only_is_redacted_and_sets_ttft(self, mock_client):
+        """`display: "omitted"`: the signature is the first output received, so it sets TTFT.
+
+        It arrives *after* thinking completes, so it is a poor proxy for when generation started --
+        which is exactly what `reasoning_type="redacted"` flags to the Runner.
+        """
+        endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7")
+        events = [
+            _message_start_event(),
+            _delta_event("signature_delta", signature="EosnCkYICxIMMb3LzNrMu..."),
+            _delta_event("text_delta", text="Answer"),
+        ]
+
+        response = _make_draft_response()
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.1, 100.6, 100.8]
+            endpoint.process_raw_response(iter(events), 100.0, response)
+
+        assert response.reasoning_type == "redacted"
+        assert response.time_to_first_token == pytest.approx(0.6)
+        assert response.time_to_first_content_token == pytest.approx(0.8)
+        assert response.response_text == "Answer"
+
+    def test_signature_alongside_thinking_does_not_imply_redaction(self, mock_client):
+        """A signature accompanies *readable* thinking too, so it is only redaction evidence alone.
+
+        Treating it as redaction unconditionally would mislabel every Claude 4 summarized response.
+        """
+        endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7")
+        events = [
+            _message_start_event(),
+            _delta_event("thinking_delta", thinking="hmm"),
+            _delta_event("signature_delta", signature="Eosn..."),
+            _delta_event("text_delta", text="Answer"),
+        ]
+
+        response = _make_draft_response()
+        endpoint.process_raw_response(iter(events), time.perf_counter(), response)
+
+        assert response.reasoning_type == "summary"
+
+    def test_fully_redacted_block_is_not_mistaken_for_no_reasoning(self, mock_client):
+        """Regression: no thinking_delta *and* no signature_delta.
+
+        Such a response used to report `reasoning_type=None` with TTFT taken from the first *text*
+        delta -- claiming the model did no reasoning when it demonstrably did.
+        """
+        endpoint = AnthropicMessagesStream(model_id="claude-3-7-sonnet")
+        events = [
+            _message_start_event(),
+            _redacted_block_event(),
+            _delta_event("text_delta", text="Answer"),
+        ]
+
+        response = _make_draft_response()
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.1, 100.4, 100.9]
+            endpoint.process_raw_response(iter(events), 100.0, response)
+
+        assert response.reasoning_type == "redacted"
+        # TTFT is the redacted block, not the later text delta
+        assert response.time_to_first_token == pytest.approx(0.4)
+        assert response.time_to_first_content_token == pytest.approx(0.9)
+
+    def test_ordinary_block_starts_do_not_set_timings(self, mock_client):
+        """Only `redacted_thinking` starts are timed; text/thinking block starts are structural."""
+        endpoint = AnthropicMessagesStream(model_id="claude-opus-4-7")
+        events = [
+            _message_start_event(),
+            _plain_block_start_event("thinking"),
+            _plain_block_start_event("text"),
+            _delta_event("text_delta", text="Answer"),
+        ]
+
+        response = _make_draft_response()
+        with patch("time.perf_counter") as clock:
+            clock.side_effect = [100.1, 100.2, 100.3, 100.9]
+            endpoint.process_raw_response(iter(events), 100.0, response)
+
+        assert response.reasoning_type is None
+        assert response.time_to_first_token == pytest.approx(0.9)
+        assert response.time_to_first_token == response.time_to_first_content_token

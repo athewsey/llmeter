@@ -32,6 +32,13 @@ import pytest
 
 from llmeter.endpoints.bedrock import BedrockConverseStream
 
+from ._prompts import (
+    REASONING_ANSWER,
+    REASONING_PROMPT,
+    SIMPLE_ANSWER,
+    SIMPLE_PROMPT,
+)
+
 
 @pytest.fixture(scope="module")
 def reasoning_model_id():
@@ -43,12 +50,9 @@ def reasoning_model_id():
     return os.environ.get("BEDROCK_REASONING_TEST_MODEL", "openai.gpt-oss-120b-1:0")
 
 
-PROMPT = "What is 15 * 37? Reply with just the number."
-
-
 def _payload() -> dict:
     return {
-        "messages": [{"role": "user", "content": [{"text": PROMPT}]}],
+        "messages": [{"role": "user", "content": [{"text": SIMPLE_PROMPT}]}],
         "inferenceConfig": {"maxTokens": 200},
     }
 
@@ -78,8 +82,8 @@ def test_converse_stream_reasoning_first_token_metrics(
     # Verify response text
     assert response.response_text is not None, "Response text should not be None"
     assert len(response.response_text) > 0, "Response text should not be empty"
-    assert "555" in response.response_text, (
-        f"Expected '555' in response, got: {response.response_text}"
+    assert SIMPLE_ANSWER in response.response_text, (
+        f"Expected {SIMPLE_ANSWER!r} in response, got: {response.response_text}"
     )
 
     # Verify timing. Both metrics come from the same stream, so the ordering is exact -
@@ -132,4 +136,79 @@ def test_converse_stream_reasoning_precedes_visible_text(
         f"({response.time_to_first_token:.3f}s) was not less than content TTFT "
         f"({response.time_to_first_content_token:.3f}s). Either the model emitted no "
         f"reasoning content, or reasoning deltas are no longer being detected."
+    )
+
+
+@pytest.mark.integ
+def test_converse_stream_reasoning_type_inferred_for_non_anthropic(
+    aws_credentials, aws_region, reasoning_model_id
+):
+    """A non-Anthropic Converse model should be detected as reasoning, and inferred `"verbatim"`.
+
+    Converse gives no structural signal for verbatim-vs-summary, so the value itself comes from the
+    model ID. What a live call verifies is that `reasoningContent` deltas arrive at all -- if they
+    stopped, `reasoning_type` would be `None` and TTFT would quietly become the first visible token.
+
+    Estimated Cost: ~$0.001 per run
+    """
+    endpoint = BedrockConverseStream(model_id=reasoning_model_id, region=aws_region)
+    assert "anthropic" not in reasoning_model_id.split("."), (
+        f"This test assumes a non-Anthropic model; got {reasoning_model_id!r}"
+    )
+
+    response = endpoint.invoke(_payload())
+
+    assert response.error is None, f"Response error: {response.error}"
+    assert response.reasoning_type == "verbatim", (
+        f"Expected reasoning detected and inferred 'verbatim', got "
+        f"{response.reasoning_type!r}. `None` means no `reasoningContent` delta was seen."
+    )
+    assert response.time_to_first_token < response.time_to_first_content_token
+
+
+@pytest.mark.integ
+def test_converse_stream_reasoning_type_inferred_for_anthropic(
+    aws_credentials, aws_region, bedrock_anthropic_converse_test_model
+):
+    """An Anthropic model via Converse should infer `"summary"`, matching Claude 4 behaviour.
+
+    Also confirms the Converse path streams *readable* `reasoningContent.text` for Claude rather
+    than only `redactedContent` -- if it were redacted, detection would report `"redacted"` and the
+    model-ID inference would never be consulted.
+
+    Estimated Cost: ~$0.002 per run (Claude pricing)
+    """
+    endpoint = BedrockConverseStream(
+        model_id=bedrock_anthropic_converse_test_model, region=aws_region
+    )
+
+    payload = {
+        "messages": [{"role": "user", "content": [{"text": REASONING_PROMPT}]}],
+        "inferenceConfig": {"maxTokens": 4096},
+        "additionalModelRequestFields": {
+            "thinking": {"type": "adaptive", "display": "summarized"}
+        },
+    }
+
+    response = endpoint.invoke(payload)
+
+    assert response.error is None, f"Response error: {response.error}"
+    if response.reasoning_type is None:
+        pytest.skip(
+            "No reasoningContent delta arrived: the model declined to think for this prompt "
+            "(adaptive thinking is the model's choice). Converse reports no thinking-token "
+            "count, so 'declined' cannot be distinguished from 'detection broke' here."
+        )
+    assert response.reasoning_type == "summary", (
+        f"Anthropic model via Converse should infer 'summary', got "
+        f"{response.reasoning_type!r}. 'redacted' would mean only encrypted reasoning arrived; "
+        f"None would mean no reasoning delta was seen at all."
+    )
+    assert response.time_to_first_token <= response.time_to_first_content_token
+
+    # The model must still have answered correctly -- reasoning content must never displace or
+    # contaminate the visible answer.
+    assert response.response_text is not None
+    assert REASONING_ANSWER in response.response_text, (
+        f"Expected {REASONING_ANSWER!r} in response, got: {response.response_text}"
     )

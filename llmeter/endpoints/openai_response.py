@@ -18,7 +18,12 @@ from openai.types.responses.response_create_params import (
 )
 
 # Local Dependencies:
-from .base import Endpoint, InvocationResponse, warn_if_ttft_visible_tokens_only_set
+from .base import (
+    Endpoint,
+    InvocationResponse,
+    ReasoningType,
+    warn_if_ttft_visible_tokens_only_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +202,16 @@ class OpenAIResponseEndpoint(OpenAIEndpointBase[Response]):
     This endpoint provides access to OpenAI's newer Responses API which offers
     structured outputs, better response format control, and improved multi-turn
     conversation handling.
+
+    Although neither first-token metric is measurable. Reasoning content that the response *does*
+    carry is still recorded on [`reasoning_type`][llmeter.endpoints.base.ReasoningType],
+    informationally: with no `time_to_first_token` there is no TPOT pairing for it to select, but
+    reporting `None` for a model that demonstrably reasoned would be misleading.
+
+    Reasoning *items* in the response state their own disclosure level, so - as with the streaming
+    variant - no `default_reasoning_visibility` is needed here: `content` means the raw reasoning was
+    returned (`"verbatim"`), `summary` means only a summary was (`"summary"`), and neither means it
+    was withheld (`"redacted"`).
     """
 
     def __init__(
@@ -281,6 +296,24 @@ class OpenAIResponseEndpoint(OpenAIEndpointBase[Response]):
         response.time_to_last_token = time.perf_counter() - start_t
         response.id = raw_response.id
         response.response_text = raw_response.output_text
+
+        # Reasoning items state their own disclosure level, exactly as the streaming event types do,
+        # so this endpoint needs no caller-declared default. There are no first-token timings on a
+        # non-streaming response, so this is informational rather than feeding TPOT.
+        # Type-guarded rather than truthiness-guarded: a placeholder/mock object would otherwise
+        # be treated as an output list and raise on iteration.
+        output_items = getattr(raw_response, "output", None)
+        for item in output_items if isinstance(output_items, (list, tuple)) else ():
+            if getattr(item, "type", None) != "reasoning":
+                continue
+            if getattr(item, "content", None):
+                response.reasoning_type = "verbatim"
+                break
+            if getattr(item, "summary", None):
+                response.reasoning_type = "summary"
+            elif response.reasoning_type is None:
+                # A reasoning item disclosing neither raw content nor a summary
+                response.reasoning_type = "redacted"
 
         usage = raw_response.usage
         if usage is not None:
@@ -395,15 +428,17 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
         - `ResponseCompletedEvent`: extracts usage from `response.usage`
         - `ResponseFailedEvent`: captures API-level errors
         - Reasoning events (`response.reasoning_summary_text.delta`,
-          `response.reasoning_text.delta`): record `time_to_first_token` only. Their content is
-          discarded and never contributes to `response_text`.
+          `response.reasoning_text.delta`): record `time_to_first_token` and `reasoning_type`
+          (`"summary"` and `"verbatim"` respectively). Their content is discarded and never
+          contributes to `response_text`.
         """
-        _REASONING_DELTA_TYPES = frozenset(
-            (
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_text.delta",
-            )
-        )
+        # The event type states the disclosure level outright, so `reasoning_type` needs no
+        # caller-declared default on this endpoint: `reasoning_text` is the reasoning itself,
+        # `reasoning_summary_text` is a summary of it.
+        _REASONING_DELTA_FIDELITY: dict[str, ReasoningType] = {
+            "response.reasoning_text.delta": "verbatim",
+            "response.reasoning_summary_text.delta": "summary",
+        }
 
         for event in raw_response:
             now = time.perf_counter()
@@ -421,9 +456,16 @@ class OpenAIResponseStreamEndpoint(OpenAIEndpointBase[Iterable[ResponseStreamEve
                     response.time_to_first_content_token = now - start_t
                 response.time_to_last_token = now - start_t
 
-            elif event.type in _REASONING_DELTA_TYPES:
+            elif event.type in _REASONING_DELTA_FIDELITY:
                 if response.time_to_first_token is None:
                     response.time_to_first_token = now - start_t
+                if response.reasoning_type is None:
+                    response.reasoning_type = _REASONING_DELTA_FIDELITY[event.type]
+                elif response.reasoning_type != _REASONING_DELTA_FIDELITY[event.type]:
+                    # Both a summary and the raw reasoning were streamed. Downgrade to "summary":
+                    # the summary is what arrived first (and set TTFT), so the full-output pairing
+                    # is not safe.
+                    response.reasoning_type = "summary"
 
             elif event.type == "response.completed":
                 usage = event.response.usage

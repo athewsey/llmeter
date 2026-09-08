@@ -23,21 +23,28 @@ sequenceDiagram
 
 ### Time to First Token (TTFT)
 
-The delay before the model produces its first output token. TTFT is primarily influenced by the model's prefill phase (processing the input prompt), any queueing at the endpoint, and network latency.
+The delay before the model produces its first output (either content or reasoning) token. TTFT is only measurable for streaming requests, and is primarily influenced by:
 
-Since it includes the time taken to process your input prompt, comparing TTFT between models/endpoints is most meaningful when the input prompts are the same (or at least very close in length).
+- The model's prefill phase (processing the input prompt)
+- Any queueing at the endpoint, and
+- Network latency
 
-!!! warning "Differences between reasoning models"
-    For models that generate reasoning/thinking before their final answer but *don't expose* this raw reasoning to clients in the response stream, TTFT will also include reasoning time and therefore vary depending on both your configured reasoning effort and the amount of thinking required for each input prompt: Making it less useful as a comparison metric.
+Since it includes the time taken to process your input prompt, comparing TTFT between models/endpoints is most meaningful when the input prompts are the same (or at least very close in length), and reasoning time is excluded.
 
-    Specifically for, **Anthropic**'s `thinking.display` setting:
+!!! warning "Important differences between reasoning models"
+    For models that generate reasoning or "thinking" before their final answer but **don't expose** this raw reasoning to clients in the response stream, TTFT will also include reasoning time - and therefore vary depending on both your configured reasoning effort and the amount of thinking required for each input prompt: Making it less useful as a comparison metric.
 
-    - `"summarized"` emits a streaming summary of thinking, which LLMeter interprets as "close enough" but may still lag behind the raw somewhat
-    - `"omitted"` (default on Claude Opus 4.7 and Mythos) will cause LLMeter to report `time_to_first_token` as `None` rather than substituting a value it knows to be wrong. The arrival time of the emitted thinking "signature" is still recorded, as `annotations["anthropic_time_to_thinking_signature"]`, since it is a useful upper bound on when thinking finished.
+    Some models expose thinking only indirectly - summarized or redacted instead of raw. Anthropic Claude 4 and later return *summarized* thinking, while Claude 3.7 Sonnet returns original thinking but occasionally redacts parts of it. LLMeter tracks the reasoning
+    disclosure level on [`InvocationResponse.reasoning_type`][llmeter.endpoints.base.InvocationResponse], and users should:
+
+    1. Ensure your LLMeter Endpoints are configured to correctly declare the reasoning type where it cannot be detected from the response, and
+    2. Consider TTFT as including all of the reasoning time when `reasoning_type` is `redacted`
+       (which covers Anthropic's `thinking.display: "omitted"`), and at least some fraction of it
+       when `summary` or `unknown`.
 
 ### Time to First Content Token (TTFCT)
 
-For a *reasoning* (or "thinking") model, the first tokens the endpoint generates are internal reasoning tokens, which are not part of the final answer and may not be visible to users depending on your overall application's design.
+For a reasoning (or "thinking") model, the first tokens the endpoint generates are internal reasoning tokens, which are not part of the final answer and may not be visible to users depending on your overall application's design.
 
 As a result, both metrics are potentially interesting and LLMeter reports both:
 
@@ -45,7 +52,7 @@ As a result, both metrics are potentially interesting and LLMeter reports both:
 - **TTFCT** is how long a user waits before starting to receive finalized output:
     - It's always equal to or longer than TTFT, because it includes the reasoning phase too
     - It's a better measure for user experience in cases where responses are streamed but users only see (or care about) the answer - not the model's internal thinking.
-    - It's *not* comparable between models or different reasoning budgets.
+    - It's *not* usefully comparable between serving providers, unless the same prompts and reasoning configurations are being used and tests are averaging over multiple attempts.
 
 ### Time to Last Token (TTLT)
 
@@ -55,23 +62,32 @@ The total end-to-end latency from sending the request to receiving the complete 
 
 The average generation speed per output token, **after** output starts.
 
-TPOT excludes the initial waiting period to provide a measure of output speed that's roughly comparable between different input prompt lengths, request queue times, or final output lengths: Answering the question "Once the model starts generating, how fast is it?".
+TPOT excludes the initial waiting period to give a measure of output speed that's roughly comparable even across different input prompt lengths, request queue times, or final output lengths: Answering the question "Once the model starts generating, how fast is it?".
 
-For non-thinking models that go straight to answer generation, or models that *share* their reasoning in the stream - LLMeter calculates TPOT based on the whole output including reasoning and final answer:
+For models that directly expose their reasoning stream, or go straight to answer generation without reasoning at all, LLMeter calculates this as:
 
 ```text
 TPOT = (TTLT - TTFT) / (output_tokens - 1)
 ```
 
-For models that do reason but **don't stream** their reasoning as it's generated, the TTFT is **not** a good proxy for when generation started: The method above would over-estimate output speed, because generation starts when reasoning starts - which is before the final answer starts.
+Some models do reason but **don't output the raw reasoning stream** - either redacting it (like Claude Sonnet 3.7), providing only a summary (like Claude 4+ with `thinking.display="summary"`), or omitting it altogether (default for Claude 4+). This would skew the TPOT calculation above because the observed time window no longer aligns with the total number of output tokens being generated. The inferred reasoning visibility for each response is stored on [`InvocationResponse.reasoning_type`][llmeter.endpoints.base.InvocationResponse].
 
-In cases like these where the endpoint *also* reports how many of the consumed output tokens were reasoning versus final answer, LLMeter will use the TTFCT and the answer-only token count to produce a self-consistent estimate of TPOT:
+Where possible in these cases, LLMeter will instead calculate TPOT based only on the answer content - excluding reasoning:
 
 ```text
 TPOT = (TTLT - TTFCT) / (visible_output_tokens - 1)
 ```
 
-For models that silently but don't share the breakdown of reasoning versus answer token count, or other cases where the required data points aren't available, `time_per_output_token` is left unset rather than giving a faulty approximation.
+This *only* works for endpoints that report the breakdown of total output token count by reasoning versus content, and assumes that all reasoning happens before the first content token output (not interleaved).
+
+
+!!! warning "Check your Endpoint's reasoning configurations"
+    Usefully-comparable TPOT and TTFT measurements depend on accurate and consistent treatment of reasoning/thinking. Some APIs (such as OpenAI Responses) make it structurally explicit in the response whether reasoning output is verbatim or summarized... But others (including Anthropic Messages, Bedrock Converse, and OpenAI Chat Completions) are ambiguous. Intermediate gateway layers can also change or mask provider behaviour.
+
+    - **Check** your target LLMeter Endpoint class for configuration parameters like `default_reasoning_visibility` controlling whether output reasoning is treated as verbatim, summarized, or something else.
+    - **Validate** that the populated [`InvocationResponse.reasoning_type`][llmeter.endpoints.base.InvocationResponse] field in your responses is consistent with your model's actual reasoning streaming behaviour.
+
+For models that don't share either the raw reasoning stream or the breakdown of reasoning versus answer token count, or other cases where the required data points aren't available, `time_per_output_token` is left unset rather than giving a faulty approximation.
 
 ### Streaming vs non-streaming
 
@@ -145,6 +161,7 @@ Each request produces an `InvocationResponse` with:
 | `num_tokens_output` | count | Output token count, **including** reasoning tokens. Reported by the endpoint or estimated by a tokenizer configured on the `Runner`. |
 | `num_tokens_input_cached` | count | Input tokens served from prompt cache. Reported by Bedrock (`cacheReadInputTokens`) and OpenAI (`cached_tokens`). `None` when caching is not active. |
 | `num_tokens_output_reasoning` | count | The reasoning portion of `num_tokens_output`. Populated where the provider breaks it out (e.g. OpenAI `reasoning_tokens`, Anthropic `thinking_tokens`); `None` otherwise. |
+| `reasoning_type` | string | How the model's reasoning was disclosed: `"verbatim"`, `"summary"`, `"redacted"`, `"unknown"`, or `None`. See [`ReasoningType`][llmeter.endpoints.base.ReasoningType]. |
 | `input_payload` | dict | The full API request payload as sent to the provider (after `prepare_payload` processing). |
 | `input_prompt` | string | The user-facing input text extracted from the payload, used for observability and as a token-counting fallback. |
 | `error` | string | Error message if the request failed, `None` otherwise. Partial data (text, timing) may still be present alongside an error for streaming endpoints that fail mid-stream. |

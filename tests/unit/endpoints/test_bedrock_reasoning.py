@@ -17,7 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from llmeter.endpoints.base import InvocationResponse
-from llmeter.endpoints.bedrock import BedrockConverseStream
+from llmeter.endpoints.bedrock import BedrockConverse, BedrockConverseStream
 
 
 def _make_draft_response() -> InvocationResponse:
@@ -39,6 +39,10 @@ def _reasoning_delta(text: str = "thinking...") -> dict:
 def _text_delta(text: str) -> dict:
     return {"contentBlockDelta": {"delta": {"text": text}}}
 
+
+_REDACTED_DELTA = {
+    "contentBlockDelta": {"delta": {"reasoningContent": {"redactedContent": b"enc"}}}
+}
 
 _USAGE_CHUNK = {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}}
 
@@ -229,3 +233,122 @@ class TestDeprecatedTtftFlag:
 
         assert results[0] == results[1]
         assert results[0] == (pytest.approx(0.2), pytest.approx(0.5))
+
+
+# ---------------------------------------------------------------------------
+# Tests: reasoning_type resolution, across both Converse endpoints
+# ---------------------------------------------------------------------------
+
+#: The reasoning shapes a Converse response can carry, expressed once per transport. Parametrising
+#: over the mode is the point: streaming and non-streaming must resolve identical content to the
+#: same `reasoning_type`, and writing them as separate suites let that parity drift unchecked.
+_REASONING_SHAPES = ("readable", "redacted", "partial", "none")
+
+
+def _stream_for_shape(shape: str) -> dict:
+    deltas = {
+        "readable": [_reasoning_delta("thinking")],
+        "redacted": [_REDACTED_DELTA],
+        "partial": [_reasoning_delta("thinking"), _REDACTED_DELTA],
+        "none": [],
+    }[shape]
+    return _stream_response([*deltas, _text_delta("Answer"), _USAGE_CHUNK])
+
+
+def _sync_for_shape(shape: str) -> dict:
+    parts = {
+        "readable": [{"reasoningContent": {"reasoningText": {"text": "thinking"}}}],
+        "redacted": [{"reasoningContent": {"redactedContent": b"enc"}}],
+        "partial": [
+            {"reasoningContent": {"reasoningText": {"text": "thinking"}}},
+            {"reasoningContent": {"redactedContent": b"enc"}},
+        ],
+        "none": [],
+    }[shape]
+    return {
+        "output": {"message": {"content": [*parts, {"text": "Answer"}]}},
+        "usage": {"inputTokens": 10, "outputTokens": 20},
+        "ResponseMetadata": {"RequestId": "req-1", "RetryAttempts": 0},
+    }
+
+
+_MODES = {
+    "streaming": (BedrockConverseStream, _stream_for_shape),
+    "non-streaming": (BedrockConverse, _sync_for_shape),
+}
+
+
+def _resolve(mode: str, shape: str, model_id: str, declared=None):
+    """Run the given endpoint over a response carrying `shape`, and return the parsed response."""
+    endpoint_cls, build = _MODES[mode]
+    endpoint = endpoint_cls(model_id=model_id, default_reasoning_visibility=declared)
+    response = _make_draft_response()
+    endpoint.process_raw_response(build(shape), time.perf_counter(), response)
+    return response
+
+
+class TestReasoningTypeResolution:
+    """How `reasoning_type` is resolved, for both Converse endpoints.
+
+    Converse cannot distinguish verbatim from summarized reasoning structurally, so readable
+    reasoning falls back to the declared or model-inferred visibility. Redaction *is* observable and
+    takes precedence - including alongside readable reasoning, since partial redaction still means
+    some reasoning was not delivered as plain text.
+    """
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "shape,expected",
+        [
+            # Readable reasoning: not observable which kind, so use the inferred default
+            ("readable", "summary"),
+            # Observable, and overrides the default
+            ("redacted", "redacted"),
+            # Partial redaction: conservative, because some reasoning was not plain text
+            ("partial", "redacted"),
+            # No reasoning at all must stay unset, *not* take the endpoint's default
+            ("none", None),
+        ],
+    )
+    def test_resolution_for_anthropic_model(self, mode, shape, expected):
+        response = _resolve(mode, shape, "anthropic.claude-opus-4-7")
+        assert response.reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize(
+        "model_id,expected",
+        [
+            ("anthropic.claude-opus-4-7", "summary"),
+            ("openai.gpt-oss-120b-1:0", "verbatim"),
+        ],
+    )
+    def test_readable_reasoning_uses_model_inference(self, mode, model_id, expected):
+        response = _resolve(mode, "readable", model_id)
+        assert response.reasoning_type == expected
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_declared_visibility_overrides_inference(self, mode):
+        """Needed for Claude models before v4, which stream their full thinking output."""
+        response = _resolve(
+            mode, "readable", "anthropic.claude-3-7-sonnet", declared="verbatim"
+        )
+        assert response.reasoning_type == "verbatim"
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_observable_redaction_beats_declared_visibility(self, mode):
+        response = _resolve(
+            mode, "redacted", "openai.gpt-oss-120b-1:0", declared="verbatim"
+        )
+        assert response.reasoning_type == "redacted"
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_reasoning_never_leaks_into_response_text(self, mode):
+        for shape in _REASONING_SHAPES:
+            response = _resolve(mode, shape, "anthropic.claude-opus-4-7")
+            assert response.response_text == "Answer", f"leaked for shape={shape!r}"
+
+    def test_non_streaming_records_no_first_token_metrics(self):
+        """Resolution must not accidentally start populating timings on a sync response."""
+        response = _resolve("non-streaming", "readable", "anthropic.claude-opus-4-7")
+        assert response.time_to_first_token is None
+        assert response.time_to_first_content_token is None
